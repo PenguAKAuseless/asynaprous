@@ -24,11 +24,12 @@ import os
 import importlib.util
 import json
 
-from   daemon import AsynapRous
+from daemon import AsynapRous
 
 app = AsynapRous()
 
-@app.route('/login', methods=['POST'])
+
+@app.route("/login", methods=["POST"])
 def login(headers="guest", body="anonymous"):
     """
     Handle user login via POST request.
@@ -44,7 +45,8 @@ def login(headers="guest", body="anonymous"):
 
     # Convert to JSON string
     json_str = json.dumps(data)
-    return (json_str.encode("utf-8"))
+    return json_str.encode("utf-8")
+
 
 @app.route("/echo", methods=["POST"])
 def echo(headers="guest", body="anonymous"):
@@ -52,18 +54,18 @@ def echo(headers="guest", body="anonymous"):
 
     try:
         message = json.loads(body)
-        data = {"received": message }
+        data = {"received": message}
         # Convert to JSON string
         json_str = json.dumps(data)
-        return (json_str.encode("utf-8"))
+        return json_str.encode("utf-8")
     except json.JSONDecodeError:
         data = {"error": "Invalid JSON"}
         # Convert to JSON string
         json_str = json.dumps(data)
-        return (json_str.encode("utf-8"))
+        return json_str.encode("utf-8")
 
 
-@app.route('/hello', methods=['PUT'])
+@app.route("/hello", methods=["PUT"])
 async def hello(headers, body):
     """
     Handle greeting via PUT request.
@@ -75,14 +77,14 @@ async def hello(headers, body):
     :param body (str): The request body or message payload.
     """
     print("[SampleApp] ['PUT'] **ASYNC** Hello in {} to {}".format(headers, body))
-    data =  {"id": 1, "name": "Alice", "email": "alice@example.com"}
+    data = {"id": 1, "name": "Alice", "email": "alice@example.com"}
 
     # Convert to JSON string
     json_str = json.dumps(data)
-    return (json_str.encode("utf-8"))
+    return json_str.encode("utf-8")
+
 
 def create_sampleapp(ip, port):
     # Prepare and launch the RESTful application
     app.prepare_address(ip, port)
     app.run()
-

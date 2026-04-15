@@ -14,7 +14,7 @@
 daemon.httpadapter
 ~~~~~~~~~~~~~~~~~
 
-This module provides a http adapter object to manage and persist 
+This module provides a http adapter object to manage and persist
 http settings (headers, bodies). The adapter supports both
 raw URL paths and RESTful route definitions, and integrates with
 Request and Response objects to handle client-server communication.
@@ -27,6 +27,7 @@ from .dictionary import CaseInsensitiveDict
 import asyncio
 import inspect
 
+
 class HttpAdapter:
     """
     A mutable :class:`HTTP adapter <HTTP adapter>` for managing client connections
@@ -34,7 +35,7 @@ class HttpAdapter:
 
     The `HttpAdapter` class encapsulates the logic for receiving HTTP requests,
     dispatching them to appropriate route handlers, and constructing responses.
-    It supports RESTful routing via hooks and integrates with :class:`Request <Request>` 
+    It supports RESTful routing via hooks and integrates with :class:`Request <Request>`
     and :class:`Response <Response>` objects for full request lifecycle management.
 
     Attributes:
@@ -97,7 +98,7 @@ class HttpAdapter:
         """
 
         # Connection handler.
-        self.conn = conn        
+        self.conn = conn
         # Connection address.
         self.connaddr = addr
         # Request handler
@@ -117,7 +118,7 @@ class HttpAdapter:
             #
             response = ""
 
-        #print("[HttpAdapter] Response content {}".format(response))
+        # print("[HttpAdapter] Response content {}".format(response))
         conn.sendall(response)
         conn.close()
 
@@ -138,12 +139,13 @@ class HttpAdapter:
         # Response handler
         resp = self.response
 
-        print("[HttpAdapter] Invoke handle_client_coroutine connection {})".format(addr))
+        print(
+            "[HttpAdapter] Invoke handle_client_coroutine connection {})".format(addr)
+        )
         addr = writer.get_extra_info("peername")
 
         # TODO Handle the request asynchronously
         msg = await reader.read(1024)
-
 
         req.prepare(msg.decode("utf-8"), routes={})
 
@@ -155,7 +157,7 @@ class HttpAdapter:
             response = ""
 
         # Build response
-        #print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
+        # print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
         response = resp.build_response(req)
 
         # Send all the response asynchronously
@@ -181,7 +183,7 @@ class HttpAdapter:
         return cookies
 
     def build_response(self, req, resp):
-        """Builds a :class:`Response <Response>` object 
+        """Builds a :class:`Response <Response>` object
 
         :param req: The :class:`Request <Request>` used to generate the response.
         :param resp: The  response object.
@@ -231,35 +233,33 @@ class HttpAdapter:
 
         return response
 
-
     # def get_connection(self, url, proxies=None):
-        # """Returns a url connection for the given URL. 
+    # """Returns a url connection for the given URL.
 
-        # :param url: The URL to connect to.
-        # :param proxies: (optional) A Requests-style dictionary of proxies used on this request.
-        # :rtype: int
-        # """
+    # :param url: The URL to connect to.
+    # :param proxies: (optional) A Requests-style dictionary of proxies used on this request.
+    # :rtype: int
+    # """
 
-        # proxy = select_proxy(url, proxies)
+    # proxy = select_proxy(url, proxies)
 
-        # if proxy:
-            # proxy = prepend_scheme_if_needed(proxy, "http")
-            # proxy_url = parse_url(proxy)
-            # if not proxy_url.host:
-                # raise InvalidProxyURL(
-                    # "Please check proxy URL. It is malformed "
-                    # "and could be missing the host."
-                # )
-            # proxy_manager = self.proxy_manager_for(proxy)
-            # conn = proxy_manager.connection_from_url(url)
-        # else:
-            # # Only scheme should be lower case
-            # parsed = urlparse(url)
-            # url = parsed.geturl()
-            # conn = self.poolmanager.connection_from_url(url)
+    # if proxy:
+    # proxy = prepend_scheme_if_needed(proxy, "http")
+    # proxy_url = parse_url(proxy)
+    # if not proxy_url.host:
+    # raise InvalidProxyURL(
+    # "Please check proxy URL. It is malformed "
+    # "and could be missing the host."
+    # )
+    # proxy_manager = self.proxy_manager_for(proxy)
+    # conn = proxy_manager.connection_from_url(url)
+    # else:
+    # # Only scheme should be lower case
+    # parsed = urlparse(url)
+    # url = parsed.geturl()
+    # conn = self.poolmanager.connection_from_url(url)
 
-        # return conn
-
+    # return conn
 
     def add_headers(self, request):
         """
@@ -268,14 +268,14 @@ class HttpAdapter:
         This method is intended to be overridden by subclasses to inject
         custom headers. It does nothing by default.
 
-        
+
         :param request: :class:`Request <Request>` to add headers to.
         """
         pass
 
     def build_proxy_headers(self, proxy):
         """Returns a dictionary of the headers to add to any request sent
-        through a proxy. 
+        through a proxy.
 
         :class:`HttpAdapter <HttpAdapter>`.
 

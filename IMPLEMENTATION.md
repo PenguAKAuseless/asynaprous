@@ -70,13 +70,13 @@ Suggested helper script location:
 
 ## Phase P0 - Core Server Completion (Must implement first)
 
-- [ ] T01: Backend connection handling and non-blocking strategy selection
+- [x] T01: Backend connection handling and non-blocking strategy selection
   - Target: concurrent incoming connection handling in backend daemon.
   - Spot: [daemon/backend.py](daemon/backend.py).
   - Why must: current accept loop has TODO and incomplete branch logic.
   - Done when: threading mode spawns per-client worker; callback mode dispatches correctly; coroutine mode runs with asyncio path.
 
-- [ ] T02: Proxy incoming connection concurrency
+- [x] T02: Proxy incoming connection concurrency
   - Target: each proxy client handled concurrently.
   - Spot: [daemon/proxy.py](daemon/proxy.py).
   - Why must: run loop has TODO after accept.

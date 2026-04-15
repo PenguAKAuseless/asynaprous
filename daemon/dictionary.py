@@ -12,8 +12,9 @@
 
 from collections import MutableMapping
 
+
 class CaseInsensitiveDict(MutableMapping):
-    """The :class:`CaseInsensitiveDict<MutableMapping>` object, which 
+    """The :class:`CaseInsensitiveDict<MutableMapping>` object, which
     contains a custom behavior of MutuableMapping.
 
     Usage::
@@ -21,7 +22,7 @@ class CaseInsensitiveDict(MutableMapping):
       >>> import tools
       >>> word = CaseInsensitiveDict(status_code='404', msg="Not found")
       >>> code = word['status_code']
-      >>> code 
+      >>> code
       404
 
       >>> msg = word['msg']
