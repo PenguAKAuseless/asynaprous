@@ -18,6 +18,8 @@ This module provides a Request object to manage and persist
 request settings (cookies, auth, proxies).
 """
 
+import base64
+import json
 from .dictionary import CaseInsensitiveDict
 
 
@@ -84,18 +86,18 @@ class Request:
             if path == "/":
                 path = "/index.html"
         except Exception:
-            return None, None
+            return None, None, None
 
         return method, path, version
 
     def prepare_headers(self, request):
         """Prepares the given HTTP headers."""
         lines = request.split("\r\n")
-        headers = {}
+        headers = CaseInsensitiveDict()
         for line in lines[1:]:
             if ": " in line:
                 key, val = line.split(": ", 1)
-                headers[key.lower()] = val
+                headers[key] = val
         return headers
 
     def fetch_headers_body(self, request):
@@ -119,55 +121,105 @@ class Request:
             )
         )
 
-        #
         # @bksysnet Preapring the webapp hook with AsynapRous instance
         # The default behaviour with HTTP server is empty routed
         #
         # TODO manage the webapp hook in this mounting point
-        #
+        
+        if not request:
+            return
+        
+        # Extract raw headers and body from the request
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+        # Extract first line
+        self.method, self.path, self.version = self.extract_request_line(self._raw_headers)
+        # Extract headers
+        self.headers = self.prepare_headers(self._raw_headers)
+        self.body = self._raw_body
 
-        if not routes == {}:
+        if routes:
             self.routes = routes
             print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
+            # Find handler hook for the request method and path
             self.hook = routes.get((self.method, self.path))
-            print("[Request] Hook has request {}".format(request))
-            #
-            # self.hook manipulation goes here
-            # ...
-            #
 
-        self._raw_heaers = ""
-        self._raw_body = ""
-        cookies = self.headers.get("cookie", "")
-        #
+            # TODO manage the webapp hook in this mounting point
+
+            if self.hook:
+                print("[Request] Hook has request {}".format(request))
+                self.prepare_body(data=self._raw_body, files=None, json=None)
+            else:
+                print("[Request] No hook for request {}".format(request))
+        
+        cookies_header = self.headers.get("cookie", "")
+        
         #  TODO: implement the cookie function here
-        #        by parsing the header            #
+        #        by parsing the header            
 
-        return
+        if cookies_header:
+            self.cookies = self.parse_cookies(cookies_header)
 
-    def prepare_body(self, data, files, json=None):
+    def prepare_body(self, data, files, json_data=None):
+        
+        # TODO prepare the body
+        
+        if json_data:
+            self.body = json.dumps(json)
+            self.headers['Content-Type'] = 'application/json'
+        elif data:
+            self.body = data
+            if 'content-type' not in self.headers:
+                self.headers['Content-Type'] = 'application/x-www-form-urlencoded'
+        elif files:
+            # Not implemented
+            pass
+        else:
+            self.body = ""
+        
         self.prepare_content_length(self.body)
-        self.body = body
-        #
-        # TODO prepare the request authentication
-        #
-        # self.auth = ...
-        return
 
     def prepare_content_length(self, body):
-        self.headers["Content-Length"] = "0"
-        #
-        # TODO prepare the request authentication
-        #
-        # self.auth = ...
-        return
+
+        # TODO prepare the content length
+        
+        if body:
+            # Handle multiple types of body content
+            length = len(body.encode('utf-8')) if isinstance(body, str) else len(body)
+            self.headers["Content-Length"] = str(length)
+        else:
+            self.headers["Content-Length"] = "0"
 
     def prepare_auth(self, auth, url=""):
-        #
+
         # TODO prepare the request authentication
-        #
-        # self.auth = ...
-        return
+        
+        if not auth:
+            return
+        if isinstance(auth, str):
+            try:
+                if auth.lower().startswith("basic "):
+                    encoded = auth.split(" ", 1)[1]
+                    decoded = base64.b64decode(encoded).decode("utf-8")
+                    self.auth = tuple(decoded.split(":", 1))
+                else:
+                    self.auth = auth
+            except Exception:
+                self.auth = None
+        elif isinstance(auth, tuple) and len(auth) == 2:
+            self.auth = auth
+        else:
+            self.auth = None
+
+        self.url = url
 
     def prepare_cookies(self, cookies):
         self.headers["Cookie"] = cookies
+
+    # Helper function
+    def parse_cookies(self, cookies_header):
+        cookies = CaseInsensitiveDict()
+        for cookie in cookies_header.split("; "):
+            if "=" in cookie:
+                key, value = cookie.strip().split("=", 1)
+                cookies[key] = value
+        return cookies

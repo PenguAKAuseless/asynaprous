@@ -82,7 +82,7 @@ Suggested helper script location:
   - Why must: run loop has TODO after accept.
   - Done when: proxy creates worker thread per accepted client and remains responsive.
 
-- [ ] T03: Complete request parsing pipeline
+- [x] T03: Complete request parsing pipeline
   - Target: parse request line, headers, body, cookies, and route hook.
   - Spot: [daemon/request.py](daemon/request.py).
   - Why must: headers/hook/body state currently incomplete and can crash.
