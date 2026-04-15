@@ -107,16 +107,29 @@ class HttpAdapter:
         resp = self.response
 
         # Handle the request
-        msg = conn.recv(1024).decode()
+        msg = conn.recv(1024).decode('utf-8')
         req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
 
         # Handle request hook
         if req.hook:
-            #
+
             # TODO: handle for App hook here
-            #
-            response = ""
+
+            body = req.body
+            headers = req.headers
+            if inspect.iscoroutinefunction(req.hook):
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                content = loop.run_until_complete(req.hook(headers=headers, body=body))
+            else:
+                content = req.hook(headers=headers, body=body)
+            response = resp.build_response(req, envelop_content=content)
+        else:
+            response = resp.build_notfound()
 
         # print("[HttpAdapter] Response content {}".format(response))
         conn.sendall(response)
@@ -147,14 +160,31 @@ class HttpAdapter:
         # TODO Handle the request asynchronously
         msg = await reader.read(1024)
 
-        req.prepare(msg.decode("utf-8"), routes={})
+        # Parse luồng thông điệp
+        if not msg:
+            writer.close()
+            return
+            
+        req.prepare(msg.decode("utf-8"), routes=self.routes)
+
+        # req.prepare(msg.decode("utf-8"), routes={})
 
         # Handle request hook
         if req.hook:
-            #
+            
             # TODO: handle for App hook here
-            #
-            response = ""
+            
+            body = getattr(req, 'body', '')
+            headers = getattr(req, 'headers', {})
+            
+            if inspect.iscoroutinefunction(req.hook):
+                content = await req.hook(headers=headers, body=body)
+            else:
+                content = req.hook(headers=headers, body=body)
+
+            response = resp.build_response(req, envelop_content=content)
+        else:
+            response = resp.build_notfound()
 
         # Build response
         # print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
