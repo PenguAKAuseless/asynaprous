@@ -164,12 +164,12 @@ class Request:
         # TODO prepare the body
         
         if json_data:
-            self.body = json.dumps(json)
+            self.body = json.dumps(json_data)
             self.headers['Content-Type'] = 'application/json'
         elif data:
             self.body = data
             if 'content-type' not in self.headers:
-                self.headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                self.headers['Content-Type'] = 'text/plain'
         elif files:
             # Not implemented
             pass
