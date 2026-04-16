@@ -10,7 +10,8 @@
 # while attending the course
 #
 
-from urlparse import urlparse
+# from urlparse import urlparse
+from urllib.parse import urlparse, unquote
 
 
 def get_auth_from_url(url):
