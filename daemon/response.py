@@ -164,9 +164,9 @@ class Response:
             elif sub_type == "html":
                 base_dir = BASE_DIR + "www/"
             else:
-                # handle_text_other(sub_type)
                 # text/csv, text/xml --> static/
                 base_dir = BASE_DIR + "static/" 
+                
         elif main_type == "image":
             base_dir = BASE_DIR + "static/"
             self.headers["Content-Type"] = "image/{}".format(sub_type)
@@ -308,6 +308,10 @@ class Response:
         print("[Response] Start build response with req {}".format(request))
 
         path = request.path
+        
+        # Default to index.html if path is root
+        if path == "/" or path == "":
+            path = "/index.html"
 
         mime_type = self.get_mime_type(path)
         print(
@@ -317,9 +321,14 @@ class Response:
         )
         
         # body
+        # Xử lý nội dung động (REST API / WebApp)
         if envelop_content is not None:
             self._content = envelop_content.encode("utf-8") if isinstance(envelop_content, str) else envelop_content
+            # if not set content-type, default to application/json
+            if "Content-Type" not in self.headers:
+                self.headers["Content-Type"] = "application/json"
         else:
+            # Xử lý nội dung tĩnh (HTML, CSS, JS, images, etc.)
             base_dir = self.prepare_content_type(mime_type)
             length, content = self.build_content(path, base_dir)
             
@@ -327,19 +336,20 @@ class Response:
                 return self.build_notfound()
             self._content = content
 
-        # If HTML, parse and serve embedded objects
-        if path.endswith(".html") or mime_type == "text/html":
-            base_dir = self.prepare_content_type(mime_type="text/html")
-        elif mime_type == "text/css":
-            base_dir = self.prepare_content_type(mime_type="text/css")
-        elif mime_type == "application/json" or mime_type == "application/octet-stream":
-            base_dir = self.prepare_content_type(mime_type="application/json")
-            envelop_content = ""
+        # Redundant - Have done in prepare_content_type
+        # # If HTML, parse and serve embedded objects
+        # if path.endswith(".html") or mime_type == "text/html":
+        #     base_dir = self.prepare_content_type(mime_type="text/html")
+        # elif mime_type == "text/css":
+        #     base_dir = self.prepare_content_type(mime_type="text/css")
+        # elif mime_type == "application/json" or mime_type == "application/octet-stream":
+        #     base_dir = self.prepare_content_type(mime_type="application/json")
+        #     envelop_content = ""
         
         # TODO: add support objects
         
-        else:
-            return self.build_notfound()
+        # else:
+        #     return self.build_notfound()
         
         self._header = self.build_response_header(request)
 
