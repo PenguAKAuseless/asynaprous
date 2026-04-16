@@ -78,6 +78,8 @@ def forward_request(host, port, request):
             "404 Not Found"
         ).encode("utf-8")
 
+RR_INDEX = {}
+rr_lock = threading.Lock()
 
 def resolve_routing_policy(hostname, routes):
     """
@@ -100,22 +102,37 @@ def resolve_routing_policy(hostname, routes):
         if len(proxy_map) == 0:
             print("[Proxy] Emtpy resolved routing of hostname {}".format(hostname))
             print("Empty proxy_map result")
+            
             # TODO: implement the error handling for non mapped host
             #       the policy is design by team, but it can be
             #       basic default host in your self-defined system
             # Use a dummy host to raise an invalid connection
+            
             proxy_host = "127.0.0.1"
             proxy_port = "9000"
-        elif len(value) == 1:
+        elif len(proxy_map) == 1:
             proxy_host, proxy_port = proxy_map[0].split(":", 2)
         # elif: # apply the policy handling
         #   proxy_map
         #   policy
         else:
+            # RR for multiple proxy_pass
+            with rr_lock:
+                if hostname not in RR_INDEX:
+                    RR_INDEX[hostname] = 0
+                    
+                idx = RR_INDEX[hostname] % len(proxy_map)
+                target_server = proxy_map[idx]
+                RR_INDEX[hostname] += 1
+                
+                print(f"[Proxy] Round-Robin selected: {target_server}")
+                proxy_host, proxy_port = target_server.split(":", 1) 
+
             # Out-of-handle mapped host
-            proxy_host = "127.0.0.1"
-            proxy_port = "9000"
+            # proxy_host = "127.0.0.1"
+            # proxy_port = "9000"
     else:
+        # proxy is singular
         print("[Proxy] resolve route of hostname {} is a singulair to".format(hostname))
         proxy_host, proxy_port = proxy_map.split(":", 2)
 
@@ -205,6 +222,7 @@ def run_proxy(ip, port, routes):
             #  TODO: implement the step of the client incoming connection
             #        using multi-thread programming with the
             #        provided handle_client routine
+            
             client_thread = threading.Thread(
                 target=handle_client, 
                 args=(ip, port, conn, addr, routes)

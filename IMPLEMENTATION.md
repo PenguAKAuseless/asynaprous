@@ -100,13 +100,13 @@ Suggested helper script location:
   - Why must: undefined symbols and incomplete header formatting block serving.
   - Done when: header builder is deterministic; Content-Length is correct; bytes sent are browser-compatible.
 
-- [ ] T06: Static object serving correctness
+- [x] T06: Static object serving correctness
   - Target: serve html/css/js/images from runtime folders.
   - Spot: [daemon/response.py](daemon/response.py), [www/index.html](www/index.html), [static/css/styles.css](static/css/styles.css).
   - Why must: assignment demo needs web pages and static assets.
   - Done when: /index.html and referenced CSS/images load with proper MIME type.
 
-- [ ] T07: Proxy route policy resolution and multi-upstream behavior
+- [x] T07: Proxy route policy resolution and multi-upstream behavior
   - Target: parse and apply dist_policy with multiple proxy_pass entries.
   - Spot: [start_proxy.py](start_proxy.py), [daemon/proxy.py](daemon/proxy.py), [config/proxy.conf](config/proxy.conf).
   - Why must: route resolver has undefined variable path and incomplete policy handling.
