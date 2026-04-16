@@ -88,7 +88,7 @@ Suggested helper script location:
   - Why must: headers/hook/body state currently incomplete and can crash.
   - Done when: Request object consistently contains method/path/version/headers/body/cookies/hook.
 
-- [ ] T04: Execute route handlers for sync and async functions
+- [x] T04: Execute route handlers for sync and async functions
   - Target: AsynapRous handlers are actually invoked and returned payload used.
   - Spot: [daemon/httpadapter.py](daemon/httpadapter.py), [apps/sampleapp.py](apps/sampleapp.py).
   - Why must: hooks are discovered but not executed correctly.

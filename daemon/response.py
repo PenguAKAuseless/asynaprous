@@ -171,7 +171,7 @@ class Response:
         elif main_type == "application":
             base_dir = BASE_DIR + "apps/"
             self.headers["Content-Type"] = "application/{}".format(sub_type)
-        #
+        
         #  TODO: process other mime_type
         #        application/xml
         #        application/zip
@@ -182,7 +182,7 @@ class Response:
         #        video/mp4
         #        video/mpeg
         #        ...
-        #
+        
         else:
             raise ValueError(
                 "Invalid MEME type: main_type={} sub_type={}".format(
@@ -226,6 +226,12 @@ class Response:
 
         :rtypes bytes: encoded HTTP response header.
         """
+        # Status line: 200 OK is default
+        status_code = self.status_code or 200
+        reason = self.reason or "OK"
+        state_line = "HTTP/1.1 {} {}\r\n".format(status_code, reason)
+        
+        # Get header of request
         reqhdr = request.headers
         rsphdr = self.headers
 
@@ -254,16 +260,20 @@ class Response:
             "Proxy-Authorization": "Basic dXNlcjpwYXNz",  # example base64
             "Warning": "199 Miscellaneous warning",
             "User-Agent": "{}".format(reqhdr.get("User-Agent", "Chrome/123.0.0.0")),
+            "Connection": "close", 
         }
 
         # Header text alignment
-        #
         #  TODO: implement the header building to create formated
         #        header from the provied headers
-        #
-        #
+        
+        fmt_header = state_line
+        for key, value in headers.items():
+            fmt_header += "{}: {}\r\n".format(key, value)
+        fmt_header += "\r\n"
+        
         # TODO prepare the request authentication
-        #
+        
         # self.auth = ...
 
         return str(fmt_header).encode("utf-8")
@@ -304,8 +314,17 @@ class Response:
                 request.method, request.path, mime_type
             )
         )
-
-        base_dir = ""
+        
+        # body
+        if envelop_content is not None:
+            self._content = envelop_content.encode("utf-8") if isinstance(envelop_content, str) else envelop_content
+        else:
+            base_dir = self.prepare_content_type(mime_type)
+            length, content = self.build_content(path, base_dir)
+            
+            if length < 0:
+                return self.build_notfound()
+            self._content = content
 
         # If HTML, parse and serve embedded objects
         if path.endswith(".html") or mime_type == "text/html":
@@ -315,11 +334,12 @@ class Response:
         elif mime_type == "application/json" or mime_type == "application/octet-stream":
             base_dir = self.prepare_content_type(mime_type="application/json")
             envelop_content = ""
-
-        #
+        
         # TODO: add support objects
-        #
+        
         else:
             return self.build_notfound()
+        
+        self._header = self.build_response_header(request)
 
         return self._header + self._content
