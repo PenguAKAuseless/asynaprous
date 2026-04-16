@@ -94,7 +94,7 @@ Suggested helper script location:
   - Why must: hooks are discovered but not executed correctly.
   - Done when: POST /login, POST /echo, PUT /hello return valid HTTP responses.
 
-- [ ] T05: Build valid HTTP response bytes
+- [x] T05: Build valid HTTP response bytes
   - Target: full response = status line + headers + CRLF + body.
   - Spot: [daemon/response.py](daemon/response.py).
   - Why must: undefined symbols and incomplete header formatting block serving.

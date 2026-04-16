@@ -164,24 +164,25 @@ class Response:
             elif sub_type == "html":
                 base_dir = BASE_DIR + "www/"
             else:
-                handle_text_other(sub_type)
+                # handle_text_other(sub_type)
+                # text/csv, text/xml --> static/
+                base_dir = BASE_DIR + "static/" 
         elif main_type == "image":
             base_dir = BASE_DIR + "static/"
             self.headers["Content-Type"] = "image/{}".format(sub_type)
+            
         elif main_type == "application":
-            base_dir = BASE_DIR + "apps/"
             self.headers["Content-Type"] = "application/{}".format(sub_type)
+            if sub_type in ["xml", "zip", "pdf", "javascript", "x-javascript"]:
+                base_dir = BASE_DIR + "static/"
+            else:
+                base_dir = BASE_DIR + "apps/"
         
         #  TODO: process other mime_type
-        #        application/xml
-        #        application/zip
-        #        ...
-        #        text/csv
-        #        text/xml
-        #        ...
-        #        video/mp4
-        #        video/mpeg
-        #        ...
+        
+        elif main_type in ["video", "audio"]:
+            self.headers["Content-Type"] = "{}/{}".format(main_type, sub_type)
+            base_dir = BASE_DIR + "static/"
         
         else:
             raise ValueError(
