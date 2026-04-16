@@ -174,8 +174,8 @@ class HttpAdapter:
             
             # TODO: handle for App hook here
             
-            body = getattr(req, 'body', '')
-            headers = getattr(req, 'headers', {})
+            body = req.body
+            headers = req.headers
             
             if inspect.iscoroutinefunction(req.hook):
                 content = await req.hook(headers=headers, body=body)
@@ -188,7 +188,7 @@ class HttpAdapter:
 
         # Build response
         # print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
-        response = resp.build_response(req)
+        # response = resp.build_response(req)
 
         # Send all the response asynchronously
         writer.write(response)
@@ -313,11 +313,11 @@ class HttpAdapter:
         :rtype: dict
         """
         headers = {}
-        #
+        
         # TODO: build your authentication here
         #       username, password =...
         # we provide dummy auth here
-        #
+        
         username, password = ("user1", "password")
 
         if username:
