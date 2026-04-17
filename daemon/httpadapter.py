@@ -24,6 +24,7 @@ from .request import Request
 from .response import Response
 from .dictionary import CaseInsensitiveDict
 from apps.auth.handlers import check_credentials
+from apps.auth.session_store import get_session_user
 
 import asyncio
 import inspect
@@ -108,17 +109,24 @@ class HttpAdapter:
 
         # Handle the request
         msg = conn.recv(1024).decode('utf-8')
+        if not msg: 
+            conn.close()
+            return
         req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
+        # Check cookie
+        session_id = req.cookies.get("session_id") if req.cookies else None
+        user_session = get_session_user(session_id)
         
         # Check authorization
-        auth_header = self.request.headers.get("Authorization")
-        self.request.prepare_auth(auth_header)
+        auth_header = req.headers.get("Authorization")
+        req.prepare_auth(auth_header)
                 
-        # check login authentication for specific paths
-        if self.request.path in ["/login", "/hello", "/login.html"]:
-            if not check_credentials(self.request.auth):
-                response = self.response.build_unauthorized()
+        # check login authentication for specific paths        
+        if req.path in ["/login", "/hello", "/login.html"]:
+            if not user_session and not check_credentials(req.auth):
+                print("[HttpAdapter] Authentication failed for {}".format(addr))
+                response = resp.build_unauthorized() 
                 conn.sendall(response)
                 conn.close()
                 return

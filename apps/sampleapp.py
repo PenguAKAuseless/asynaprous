@@ -25,6 +25,7 @@ import importlib.util
 import json
 
 from daemon import AsynapRous
+from .tracker.handlers import handle_submit_info, handle_get_list 
 
 app = AsynapRous()
 
@@ -83,6 +84,13 @@ async def hello(headers, body):
     json_str = json.dumps(data)
     return json_str.encode("utf-8")
 
+@app.route("/submit-info", methods=["POST"])
+def submit_info(headers, body):
+    return handle_submit_info(headers, body)
+
+@app.route("/get-list", methods=["GET"])
+def get_list(headers, body):
+    return handle_get_list(headers, body)
 
 def create_sampleapp(ip, port):
     # Prepare and launch the RESTful application

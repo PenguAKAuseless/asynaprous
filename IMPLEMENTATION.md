@@ -126,7 +126,7 @@ Suggested helper script location:
   - Why must: assignment section 2.2 requires authentication mechanism.
   - Done when: unauthorized request returns 401 + challenge; valid credentials allow access.
 
-- [ ] T10: Cookie-based authentication/session tracking
+- [x] T10: Cookie-based authentication/session tracking
   - Target: Set-Cookie and Cookie parsing and access control.
   - Spot: [daemon/request.py](daemon/request.py), [daemon/response.py](daemon/response.py), apps/auth/session_store.py.
   - Why must: assignment explicitly requests cookie handling and access control.
