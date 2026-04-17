@@ -28,6 +28,7 @@ import asyncio
 import inspect
 
 
+
 class HttpAdapter:
     """
     A mutable :class:`HTTP adapter <HTTP adapter>` for managing client connections
@@ -110,7 +111,23 @@ class HttpAdapter:
         msg = conn.recv(1024).decode('utf-8')
         req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
-
+        
+        # Check authorization
+        auth_header = self.request.headers.get("Authorization")
+        # Gọi hàm để bóc tách và lưu vào self.request.auth
+        self.request.prepare_auth(auth_header)
+        
+        valid_user = ("admin", "123456")
+        
+        # Kiểm tra logic xác thực
+        if self.request.path in ["/login", "/hello", "/login.html"]:
+            if self.request.auth != valid_user:
+                print("[HttpAdapter] Authentication failed for {}".format(addr))
+                # Gọi hàm tạo phản hồi 401 đã viết trong Response
+                response = self.response.build_unauthorized()
+                conn.sendall(response)
+                conn.close()
+                return
         # Handle request hook
         if req.hook:
 

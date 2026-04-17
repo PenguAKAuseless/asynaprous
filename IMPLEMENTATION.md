@@ -112,7 +112,7 @@ Suggested helper script location:
   - Why must: route resolver has undefined variable path and incomplete policy handling.
   - Done when: single-upstream and multi-upstream hosts forward predictably (round-robin baseline).
 
-- [ ] T08: Python compatibility blockers
+- [x] T08: Python compatibility blockers
   - Target: modern import compatibility and utility correctness.
   - Spot: [daemon/utils.py](daemon/utils.py), [daemon/dictionary.py](daemon/dictionary.py).
   - Why must: legacy imports can break execution.

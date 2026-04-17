@@ -354,3 +354,33 @@ class Response:
         self._header = self.build_response_header(request)
 
         return self._header + self._content
+
+    # Helper function
+    def build_unauthorized(self, realm="AsynapRous"):
+        """
+        401 Let user know they must login (unauthorized)
+        create a standard 401 Unauthorized HTTP response with a WWW-Authenticate header.
+        www-authenticate header is compulsory for the browser to display the login.
+        realm is label, displayed on login form to let user know where they are.
+
+        Args:
+            realm (str, optional): _description_. Defaults to "AsynapRous".
+        """
+        self.status_code = 401
+        self.reason = "Unauthorized"
+        
+        auth_header = 'WWW-Authenticate: Basic realm="{}"\r\n'.format(realm)
+        
+        # Raw HTTP Response
+        response_line = "HTTP/1.1 401 Unauthorized\r\n"
+        headers = (
+            "WWW-Authenticate: {}\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: 25\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).format(auth_header)
+        
+        body = "<h1>401 Unauthorized</h1>"
+        
+        return (response_line + headers + body).encode("utf-8")

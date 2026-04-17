@@ -194,7 +194,9 @@ class Request:
         # TODO prepare the request authentication
         
         if not auth:
+            self.auth = None
             return
+        
         if isinstance(auth, str):
             try:
                 if auth.lower().startswith("basic "):
