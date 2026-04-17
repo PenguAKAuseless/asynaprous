@@ -216,6 +216,9 @@ class Request:
 
     def prepare_cookies(self, cookies):
         self.headers["Cookie"] = cookies
+        # call parse if see header cookie
+        if "cookie" in self.headers:
+            self.cookies = self.parse_cookies(self.headers["cookie"])
 
     # Helper function
     def parse_cookies(self, cookies_header):
@@ -223,5 +226,5 @@ class Request:
         for cookie in cookies_header.split("; "):
             if "=" in cookie:
                 key, value = cookie.strip().split("=", 1)
-                cookies[key] = value
+                cookies[key.strip()] = value.strip()    
         return cookies

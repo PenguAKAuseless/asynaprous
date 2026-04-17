@@ -120,7 +120,7 @@ Suggested helper script location:
 
 ## Phase P1 - Assignment-Mandatory Features
 
-- [ ] T09: HTTP authentication via headers
+- [x] T09: HTTP authentication via headers
   - Target: RFC-inspired auth flow with WWW-Authenticate and Authorization support.
   - Spot: [daemon/request.py](daemon/request.py), [daemon/response.py](daemon/response.py), [daemon/httpadapter.py](daemon/httpadapter.py), apps/auth/handlers.py.
   - Why must: assignment section 2.2 requires authentication mechanism.

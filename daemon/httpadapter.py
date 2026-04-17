@@ -23,11 +23,10 @@ Request and Response objects to handle client-server communication.
 from .request import Request
 from .response import Response
 from .dictionary import CaseInsensitiveDict
+from apps.auth.handlers import check_credentials
 
 import asyncio
 import inspect
-
-
 
 class HttpAdapter:
     """
@@ -114,16 +113,11 @@ class HttpAdapter:
         
         # Check authorization
         auth_header = self.request.headers.get("Authorization")
-        # Gọi hàm để bóc tách và lưu vào self.request.auth
         self.request.prepare_auth(auth_header)
-        
-        valid_user = ("admin", "123456")
-        
-        # Kiểm tra logic xác thực
+                
+        # check login authentication for specific paths
         if self.request.path in ["/login", "/hello", "/login.html"]:
-            if self.request.auth != valid_user:
-                print("[HttpAdapter] Authentication failed for {}".format(addr))
-                # Gọi hàm tạo phản hồi 401 đã viết trong Response
+            if not check_credentials(self.request.auth):
                 response = self.response.build_unauthorized()
                 conn.sendall(response)
                 conn.close()

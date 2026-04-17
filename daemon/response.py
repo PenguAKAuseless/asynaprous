@@ -384,3 +384,11 @@ class Response:
         body = "<h1>401 Unauthorized</h1>"
         
         return (response_line + headers + body).encode("utf-8")
+    
+    def set_cookie (self, key, value, max_age=3600, path="/"):
+        cookie_str = "{}={}; Max-Age={}; Path={}".format(key, value, max_age, path)
+        if "Set-Cookie" not in self.headers:
+            self.headers["Set-Cookie"] = cookie_str
+        else:
+            # Hỗ trợ nhiều cookie bằng cách gộp lại hoặc dùng list (tùy framework)
+            self.headers["Set-Cookie"] += "\\r\\nSet-Cookie: " + cookie_str
