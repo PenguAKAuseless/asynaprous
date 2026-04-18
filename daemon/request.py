@@ -147,7 +147,7 @@ class Request:
 
             if self.hook:
                 print("[Request] Hook has request {}".format(request))
-                self.prepare_body(data=self._raw_body, files=None, json=None)
+                self.prepare_body(data=self._raw_body, files=None, json_data=None)
             else:
                 print("[Request] No hook for request {}".format(request))
         

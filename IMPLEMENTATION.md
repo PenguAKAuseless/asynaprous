@@ -132,7 +132,7 @@ Suggested helper script location:
   - Why must: assignment explicitly requests cookie handling and access control.
   - Done when: login issues cookie and protected endpoints validate session cookie.
 
-- [ ] T11: Client-server initialization APIs for hybrid chat
+- [x] T11: Client-server initialization APIs for hybrid chat
   - Target: implement peer registration/tracker APIs.
   - Spot: apps/tracker/handlers.py, apps/tracker/registry.py, [daemon/httpadapter.py](daemon/httpadapter.py).
   - Required APIs: /submit-info, /add-list, /get-list.
