@@ -26,7 +26,15 @@ import json
 
 from daemon import AsynapRous
 from .tracker.handlers import handle_submit_info, handle_get_list 
-from .chat.handlers import handle_send_peer, handle_broadcast_peer, handle_connect_peer
+from .chat.handlers import (
+    handle_send_peer, 
+    handle_broadcast_peer, 
+    handle_connect_peer, 
+    handle_get_channels, 
+    handle_get_channel_msgs, 
+    handle_send_channel_msg,
+    handle_receive_channel_msg
+)
 
 app = AsynapRous()
 
@@ -119,6 +127,22 @@ def receive_msg(headers, body):
         return json.dumps(response_data).encode("utf-8")
     except json.JSONDecodeError:
         return json.dumps({"status": "error", "message": "Invalid JSON"}).encode("utf-8")
+
+@app.route("/api/channels", methods=["GET"])
+def api_channels(headers, body):
+    return handle_get_channels(headers, body)
+
+@app.route("/api/get-messages", methods=["POST"])
+def api_get_messages(headers, body):
+    return handle_get_channel_msgs(headers, body)
+
+@app.route("/api/send-channel", methods=["POST"])
+def api_send_channel(headers, body):
+    return handle_send_channel_msg(headers, body)
+
+@app.route("/api/receive-channel", methods=["POST"])
+def api_receive_channel(headers, body):
+    return handle_receive_channel_msg(headers, body)
 
 def create_sampleapp(ip, port):
     # Prepare and launch the RESTful application

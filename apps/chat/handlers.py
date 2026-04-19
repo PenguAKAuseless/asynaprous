@@ -1,5 +1,6 @@
 import json
 import socket
+import threading
 from .peer_service import add_peer_info, get_all_peers, get_peer_info
 from .channel_service import get_channels, get_messages, add_message
 
@@ -11,7 +12,7 @@ def _send_http_post(target_ip, target_port, payload):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # create new socket
         s.settimeout(5)
-        s.connect((target_ip, target_port))                     # connect to target peer
+        s.connect((target_ip, int(target_port)))                     # connect to target peer
         
         body = json.dumps(payload)
         request = (
@@ -86,4 +87,24 @@ def handle_send_channel_msg(headers, body):
     sender = data.get("sender", "me")
     
     add_message(channel, sender, msg)
+    
+    peers = get_all_peers()
+    for p_id, info in peers.items():
+        payload = {"channel": channel, "message": msg, "sender": "Peer"}
+    
+        client_thread = threading.Thread(
+            target=_send_http_post, 
+            args=(info['ip'], info['port'], payload, "/api/receive-channel")
+        )
+        client_thread.daemon = True
+        client_thread.start()
     return json.dumps({"status": "ok"})
+
+def handle_receive_channel_msg(headers, body):
+    data = json.loads(body)
+    channel = data.get("channel", "general")
+    msg = data.get("message", "")
+    sender = data.get("sender", "Unknown")
+    
+    add_message(channel, sender, msg)
+    return json.dumps({"status": "received"})

@@ -26,7 +26,10 @@ import os
 import mimetypes
 from .dictionary import CaseInsensitiveDict
 
-BASE_DIR = ""
+# find directory 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/"
+
+# BASE_DIR = ""
 
 
 class Response:
@@ -127,7 +130,14 @@ class Response:
 
         :rtype str: MIME type string (e.g., 'text/html', 'image/png').
         """
-
+        path_lower = path.lower()
+        if path_lower.endswith(".html"):
+            return "text/html"
+        if path_lower.endswith(".css"):
+            return "text/css"
+        if path_lower.endswith(".js"):
+            return "application/javascript"
+        
         try:
             mime_type, _ = mimetypes.guess_type(path)
         except Exception:

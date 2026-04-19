@@ -146,7 +146,7 @@ Suggested helper script location:
   - Why must: assignment section 2.3 peer chatting phase.
   - Done when: peer can connect, send direct message, and broadcast to connected peers.
 
-- [ ] T13: Channel management behaviors
+- [x] T13: Channel management behaviors
   - Target: channel list, message view, submit, notifications, immutable messages.
   - Spot: apps/chat/channel_service.py, frontend/pages/chat.html, frontend/assets/js/chat-ui.js.
   - Why must: assignment section 2.3 core functional requirements.
