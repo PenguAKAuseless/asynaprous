@@ -1,12 +1,120 @@
-<html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login</title>
+  <style>
+    body {
+      font-family: Helvetica, sans-serif;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background: linear-gradient(135deg, #f8f9fb, #e8eef5);
+    }
 
+    .card {
+      width: min(360px, 90vw);
+      background: white;
+      border-radius: 10px;
+      padding: 24px;
+      box-shadow: 0 12px 30px rgba(31, 41, 55, 0.12);
+    }
+
+    h1 {
+      margin-top: 0;
+      font-size: 1.4rem;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-size: 0.9rem;
+      color: #334155;
+    }
+
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 6px;
+      padding: 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+    }
+
+    button {
+      width: 100%;
+      margin-top: 16px;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      background: #0f766e;
+      color: white;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    #error {
+      color: #b91c1c;
+      min-height: 1.2em;
+      margin-top: 10px;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
 <body>
-  <h1>Login</h1>
-  <form method="POST" action="/login">
-    Username: <input name="username" type="text"><br>
-    Password: <input name="password" type="password"><br>
-    <input type="submit" value="Login">
-  </form>
-</body>
+  <div class="card">
+    <h1>Sign In</h1>
+    <form id="login-form">
+      <label>
+        Username
+        <input id="username" name="username" type="text" required>
+      </label>
 
+      <label>
+        Password
+        <input id="password" name="password" type="password" required>
+      </label>
+
+      <button type="submit">Login</button>
+    </form>
+    <div id="error"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("login-form");
+    const errorNode = document.getElementById("error");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      errorNode.textContent = "";
+
+      const username = document.getElementById("username").value.trim();
+      const password = document.getElementById("password").value;
+
+      try {
+        const response = await fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+
+        if (response.status === 401) {
+          errorNode.textContent = "Invalid username or password.";
+          return;
+        }
+
+        if (!response.ok) {
+          errorNode.textContent = "Login failed. Please try again.";
+          return;
+        }
+
+        window.location.href = "/chat.html";
+      } catch (err) {
+        errorNode.textContent = "Network error. Please retry.";
+      }
+    });
+  </script>
+</body>
 </html>

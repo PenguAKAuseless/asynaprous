@@ -1,110 +1,256 @@
+"""Chat handlers for peer messaging and channel operations."""
+
 import json
 import socket
 import threading
-from .peer_service import add_peer_info, get_all_peers, get_peer_info
-from .channel_service import get_channels, get_messages, add_message
 
-def _send_http_post(target_ip, target_port, payload):
-    """
-    Send an HTTP POST request t  o the target peer with the given payload.
-    This function creates a raw socket connection to the target peer and sends
-    """
+from .channel_service import add_message, get_channels, get_messages
+from .peer_service import add_peer_info, get_all_peers, get_peer_info
+from .protocol import (
+    COMMAND_BROADCAST_PEER,
+    COMMAND_CHANNEL_MESSAGE,
+    COMMAND_SEND_PEER,
+    build_envelope,
+    build_error,
+    validate_envelope,
+)
+
+
+def _json(payload):
+    return json.dumps(payload)
+
+
+def _parse_json(body):
+    if not body:
+        return {}
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # create new socket
-        s.settimeout(5)
-        s.connect((target_ip, int(target_port)))                     # connect to target peer
-        
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+
+def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", timeout=5):
+    """Send an HTTP POST request to target peer and return delivery result."""
+    try:
         body = json.dumps(payload)
         request = (
-            f"POST /receive-msg HTTP/1.1\r\n"
-            f"Host: {target_ip}:{target_port}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n\r\n"
-            f"{body}"
-        )
-        s.sendall(request.encode('utf-8'))
-        s.close()
+            "POST {} HTTP/1.1\r\n"
+            "Host: {}:{}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: {}\r\n"
+            "Connection: close\r\n\r\n"
+            "{}"
+        ).format(endpoint, target_ip, target_port, len(body.encode("utf-8")), body)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((target_ip, int(target_port)))
+        sock.sendall(request.encode("utf-8"))
+
+        # Drain response so the peer completes write path cleanly.
+        while True:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+
+        sock.close()
         return True
-    except Exception as e:
-        print(f"[P2P Error] {e}")
+    except Exception as exc:
+        print("[P2P Error] {}".format(exc))
         return False
 
+
+def _extract_peer_payload(data):
+    """Extract sender/message/channel from either envelope or legacy payload."""
+    if validate_envelope(data):
+        payload = data.get("payload", {})
+        sender = data.get("sender", "peer")
+        message = payload.get("message") or payload.get("msg", "")
+        channel = payload.get("channel", "general")
+        return sender, message, channel
+
+    sender = data.get("from") or data.get("sender", "peer")
+    message = data.get("msg") or data.get("message", "")
+    channel = data.get("channel", "general")
+    return sender, message, channel
+
+
 def handle_connect_peer(headers, body):
-    """
-    Handle the connection request from another peer.
-    """
-    data = json.loads(body)
+    """Handle /connect-peer for storing remote peer endpoint."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
     peer_id = data.get("peer_id")
     ip = data.get("ip")
     port = data.get("port")
-    if add_peer_info(peer_id, ip, port):        # from peer_service.py - Save info 
-        return json.dumps({"status": "connected", "peer": peer_id})
-    return json.dumps({"status": "error"})
+
+    if not peer_id or not ip or port is None:
+        return _json(build_error("missing-fields", "Missing peer_id, ip, or port"))
+
+    if add_peer_info(peer_id, ip, port):
+        return _json({"status": "connected", "peer": peer_id})
+
+    return _json(build_error("invalid-peer", "Invalid peer endpoint"))
+
 
 def handle_send_peer(headers, body):
-    """
-    API /send-peer: direct message to a specific peer (to_peer) 
-    """
-    data = json.loads(body)
-    peer_id = data.get("to_peer")   
-    message = data.get("message")
-    
+    """Handle /send-peer direct peer-to-peer message delivery."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    peer_id = data.get("to_peer")
+    message = str(data.get("message", "")).strip()
+    sender = data.get("sender", "me")
+
+    if not peer_id or not message:
+        return _json(build_error("missing-fields", "Missing to_peer or message"))
+
     info = get_peer_info(peer_id)
-    if info:
-        # Send message to the target peer using HTTP POST
-        success = _send_http_post(info['ip'], info['port'], {"from": "me", "msg": message})
-        if success:
-            return json.dumps({"status": "sent"})
-    return json.dumps({"status": "error", "message": "Peer unreachable"})
+    if not info:
+        return _json(build_error("peer-not-found", "Peer not found"))
+
+    envelope = build_envelope(
+        COMMAND_SEND_PEER,
+        payload={"message": message},
+        sender=str(sender),
+    )
+
+    success = _send_http_post(info["ip"], info["port"], envelope, endpoint="/receive-msg")
+    if success:
+        return _json({"status": "sent"})
+
+    return _json(build_error("peer-unreachable", "Peer unreachable"))
+
 
 def handle_broadcast_peer(headers, body):
-    """
-    API /broadcast-peer: Send message to all peers in the chat list
-    """
-    data = json.loads(body)
-    message = data.get("message")
-    peers = get_all_peers()
-    count = 0
-    for p_id, info in peers.items():
-        if _send_http_post(info['ip'], info['port'], {"from": "me", "msg": message}):
-            count += 1
-    return json.dumps({"status": "broadcast_done", "delivered": count})
+    """Handle /broadcast-peer for fan-out to all connected peers."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
 
-# You can add more handlers for channel management, message retrieval, etc. here.
+    message = str(data.get("message", "")).strip()
+    sender = data.get("sender", "me")
+    if not message:
+        return _json(build_error("missing-message", "Missing message"))
+
+    peers = get_all_peers()
+    delivered = 0
+
+    envelope = build_envelope(
+        COMMAND_BROADCAST_PEER,
+        payload={"message": message},
+        sender=str(sender),
+    )
+
+    for info in peers.values():
+        if _send_http_post(info["ip"], info["port"], envelope, endpoint="/receive-msg"):
+            delivered += 1
+
+    return _json({"status": "broadcast_done", "delivered": delivered})
+
+
+def handle_receive_msg(headers, body):
+    """Handle /receive-msg callback endpoint for direct peer messages."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    sender, message, channel = _extract_peer_payload(data)
+    message = str(message).strip()
+    if not message:
+        return _json(build_error("empty-message", "Message is empty"))
+
+    add_message(channel, sender, message)
+    print("\n[NEW MESSAGE] from {}: {}\n".format(sender, message))
+    return _json({"status": "received"})
+
+
 def handle_get_channels(headers, body):
-    return json.dumps(get_channels())
+    """Handle GET /api/channels."""
+    _ = headers
+    _ = body
+    return _json(get_channels())
+
 
 def handle_get_channel_msgs(headers, body):
-    data = json.loads(body)
+    """Handle POST /api/get-messages."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
     channel = data.get("channel", "general")
-    return json.dumps(get_messages(channel))
+    return _json(get_messages(channel))
+
 
 def handle_send_channel_msg(headers, body):
-    data = json.loads(body)
+    """Handle POST /api/send-channel and replicate to connected peers."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
     channel = data.get("channel", "general")
-    msg = data.get("message", "")
-    sender = data.get("sender", "me")
-    
-    add_message(channel, sender, msg)
-    
+    sender = str(data.get("sender", "me"))
+    message = str(data.get("message", "")).strip()
+
+    if not message:
+        return _json(build_error("missing-message", "Missing message"))
+    if len(message) > 2000:
+        return _json(build_error("message-too-long", "Message exceeds 2000 chars"))
+
+    stored = add_message(channel, sender, message)
+
     peers = get_all_peers()
-    for p_id, info in peers.items():
-        payload = {"channel": channel, "message": msg, "sender": "Peer"}
-    
-        client_thread = threading.Thread(
-            target=_send_http_post, 
-            args=(info['ip'], info['port'], payload, "/api/receive-channel")
+    delivered = 0
+    delivered_lock = threading.Lock()
+
+    def _send_channel(info):
+        nonlocal delivered
+        envelope = build_envelope(
+            COMMAND_CHANNEL_MESSAGE,
+            payload={"channel": channel, "message": message},
+            sender=sender,
         )
-        client_thread.daemon = True
-        client_thread.start()
-    return json.dumps({"status": "ok"})
+        ok = _send_http_post(
+            info["ip"],
+            info["port"],
+            envelope,
+            endpoint="/api/receive-channel",
+        )
+        if ok:
+            with delivered_lock:
+                delivered += 1
+
+    threads = []
+    for info in peers.values():
+        worker = threading.Thread(target=_send_channel, args=(info,), daemon=True)
+        worker.start()
+        threads.append(worker)
+
+    for worker in threads:
+        worker.join(timeout=2)
+
+    return _json({"status": "ok", "delivered": delivered, "message": stored})
+
 
 def handle_receive_channel_msg(headers, body):
-    data = json.loads(body)
-    channel = data.get("channel", "general")
-    msg = data.get("message", "")
-    sender = data.get("sender", "Unknown")
-    
-    add_message(channel, sender, msg)
-    return json.dumps({"status": "received"})
+    """Handle /api/receive-channel callback endpoint."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    sender, message, channel = _extract_peer_payload(data)
+    message = str(message).strip()
+    if not message:
+        return _json(build_error("empty-message", "Message is empty"))
+
+    add_message(channel, sender, message)
+    return _json({"status": "received"})

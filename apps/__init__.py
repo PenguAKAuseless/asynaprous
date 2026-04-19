@@ -10,4 +10,11 @@
 # while attending the course
 #
 
-from .sampleapp import create_sampleapp
+"""Application package entrypoints."""
+
+
+def create_sampleapp(ip, port):
+	"""Lazy loader to avoid circular imports during daemon bootstrapping."""
+	from .sampleapp import create_sampleapp as _create_sampleapp
+
+	return _create_sampleapp(ip, port)

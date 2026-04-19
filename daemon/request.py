@@ -14,12 +14,15 @@
 daemon.request
 ~~~~~~~~~~~~~~~~~
 
-This module provides a Request object to manage and persist
-request settings (cookies, auth, proxies).
+This module provides a Request object to manage and persist request settings,
+including request line parsing, header/body extraction, cookies, and
+authentication metadata.
 """
 
 import base64
 import json
+from urllib.parse import parse_qs, urlsplit
+
 from .dictionary import CaseInsensitiveDict
 
 
@@ -43,16 +46,20 @@ class Request:
 
     __attrs__ = [
         "method",
+        "path",
+        "version",
         "url",
         "headers",
         "body",
         "_raw_headers",
         "_raw_body",
-        "reason",
         "cookies",
-        "body",
+        "auth",
         "routes",
         "hook",
+        "query",
+        "is_valid",
+        "error",
     ]
 
     def __init__(self):
@@ -76,127 +83,151 @@ class Request:
         self.routes = {}
         #: Hook point for routed mapped-path
         self.hook = None
+        #: Authentication tuple (username, password) if parsed
+        self.auth = None
+        #: Parsed query parameters
+        self.query = {}
+        #: Request validity flag
+        self.is_valid = False
+        #: Validation error description
+        self.error = ""
 
     def extract_request_line(self, request):
-        try:
-            lines = request.splitlines()
-            first_line = lines[0]
-            method, path, version = first_line.split()
-
-            if path == "/":
-                path = "/index.html"
-        except Exception:
+        """Parse request line into method, path, and version."""
+        lines = request.splitlines()
+        if not lines:
             return None, None, None
 
-        return method, path, version
+        first_line = lines[0].strip()
+        parts = first_line.split()
+        if len(parts) != 3:
+            return None, None, None
+
+        method, path, version = parts
+        return method.upper(), path, version
+
+    def _normalize_path(self, raw_path):
+        """Normalize URL path for route lookup and static resolution."""
+        parsed_url = urlsplit(raw_path)
+        path = parsed_url.path or "/"
+
+        # Preserve root semantics used by this assignment skeleton.
+        if path == "/":
+            path = "/index.html"
+
+        # Accept both '/path' and '/path/' for handler matching.
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
+
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        query_map = {}
+        for key, value in query.items():
+            query_map[key] = value[0] if len(value) == 1 else value
+
+        return path, query_map
 
     def prepare_headers(self, request):
-        """Prepares the given HTTP headers."""
+        """Parse HTTP headers into a case-insensitive dictionary."""
         lines = request.split("\r\n")
         headers = CaseInsensitiveDict()
         for line in lines[1:]:
-            if ": " in line:
-                key, val = line.split(": ", 1)
-                headers[key] = val
+            if not line or ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            headers[key.strip()] = val.strip()
         return headers
 
     def fetch_headers_body(self, request):
-        """Prepares the given HTTP headers."""
-        # Split request into header section and body section
-        parts = request.split("\r\n\r\n", 1)  # split once at blank line
-
-        _headers = parts[0]
-        _body = parts[1] if len(parts) > 1 else ""
-        return _headers, _body
+        """Split an HTTP message into raw headers and raw body."""
+        parts = request.split("\r\n\r\n", 1)
+        raw_headers = parts[0]
+        raw_body = parts[1] if len(parts) > 1 else ""
+        return raw_headers, raw_body
 
     def prepare(self, request, routes=None):
-        """Prepares the entire request with the given parameters."""
+        """Prepare and validate the incoming HTTP message."""
 
-        # Prepare the request line from the request header
-        print("[Request] prepare request missg {}".format(request))
-        self.method, self.path, self.version = self.extract_request_line(request)
-        print(
-            "[Request] {} path {} version {}".format(
-                self.method, self.path, self.version
-            )
-        )
+        # Reset request state for re-use safety.
+        self.method = None
+        self.path = None
+        self.version = None
+        self.url = None
+        self.headers = CaseInsensitiveDict()
+        self.body = ""
+        self._raw_headers = ""
+        self._raw_body = ""
+        self.cookies = CaseInsensitiveDict()
+        self.auth = None
+        self.routes = routes or {}
+        self.hook = None
+        self.query = {}
+        self.is_valid = False
+        self.error = ""
 
-        # @bksysnet Preapring the webapp hook with AsynapRous instance
-        # The default behaviour with HTTP server is empty routed
-        #
-        # TODO manage the webapp hook in this mounting point
-        
-        if not request:
+        if isinstance(request, (bytes, bytearray)):
+            request = request.decode("utf-8", errors="replace")
+
+        if not request or not str(request).strip():
+            self.error = "Empty request"
             return
-        
-        # Extract raw headers and body from the request
-        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
-        # Extract first line
-        self.method, self.path, self.version = self.extract_request_line(self._raw_headers)
-        # Extract headers
+
+        self._raw_headers, self._raw_body = self.fetch_headers_body(str(request))
+        method, raw_path, version = self.extract_request_line(self._raw_headers)
+
+        if not method or not raw_path or not version:
+            self.error = "Malformed request line"
+            return
+
+        normalized_path, query_map = self._normalize_path(raw_path)
+        self.method = method
+        self.path = normalized_path
+        self.version = version
+        self.url = raw_path
+        self.query = query_map
+
         self.headers = self.prepare_headers(self._raw_headers)
         self.body = self._raw_body
 
-        if routes:
-            self.routes = routes
-            print("[Request] Routing METHOD {} path {}".format(self.method, self.path))
-            # Find handler hook for the request method and path
-            self.hook = routes.get((self.method, self.path))
+        cookie_header = self.headers.get("Cookie", "")
+        if cookie_header:
+            self.cookies = self.parse_cookies(cookie_header)
 
-            # TODO manage the webapp hook in this mounting point
+        if self.routes:
+            self.hook = self.routes.get((self.method, self.path))
 
-            if self.hook:
-                print("[Request] Hook has request {}".format(request))
-                self.prepare_body(data=self._raw_body, files=None, json_data=None)
-            else:
-                print("[Request] No hook for request {}".format(request))
-        
-        cookies_header = self.headers.get("cookie", "")
-        
-        #  TODO: implement the cookie function here
-        #        by parsing the header            
-
-        if cookies_header:
-            self.cookies = self.parse_cookies(cookies_header)
+        self.is_valid = True
 
     def prepare_body(self, data, files, json_data=None):
-        
-        # TODO prepare the body
-        
+        """Prepare body and update content-related headers."""
         if json_data:
             self.body = json.dumps(json_data)
-            self.headers['Content-Type'] = 'application/json'
+            self.headers["Content-Type"] = "application/json"
         elif data:
             self.body = data
-            if 'content-type' not in self.headers:
-                self.headers['Content-Type'] = 'text/plain'
+            if "Content-Type" not in self.headers:
+                self.headers["Content-Type"] = "text/plain"
         elif files:
             # Not implemented
             pass
         else:
             self.body = ""
-        
+
         self.prepare_content_length(self.body)
 
     def prepare_content_length(self, body):
-
-        # TODO prepare the content length
-        
+        """Set Content-Length from body bytes/str."""
         if body:
-            # Handle multiple types of body content
-            length = len(body.encode('utf-8')) if isinstance(body, str) else len(body)
+            length = len(body.encode("utf-8")) if isinstance(body, str) else len(body)
             self.headers["Content-Length"] = str(length)
         else:
             self.headers["Content-Length"] = "0"
 
     def prepare_auth(self, auth, url=""):
-
-        # TODO prepare the request authentication
-        
+        """Parse Authorization header to an auth tuple when possible."""
         if not auth:
             self.auth = None
             return
-        
+
         if isinstance(auth, str):
             try:
                 if auth.lower().startswith("basic "):
@@ -216,15 +247,42 @@ class Request:
 
     def prepare_cookies(self, cookies):
         self.headers["Cookie"] = cookies
-        # call parse if see header cookie
-        if "cookie" in self.headers:
-            self.cookies = self.parse_cookies(self.headers["cookie"])
+        if "Cookie" in self.headers:
+            self.cookies = self.parse_cookies(self.headers["Cookie"])
 
-    # Helper function
     def parse_cookies(self, cookies_header):
+        """Parse Cookie header into key/value dictionary."""
         cookies = CaseInsensitiveDict()
-        for cookie in cookies_header.split("; "):
+        for cookie in cookies_header.split(";"):
             if "=" in cookie:
                 key, value = cookie.strip().split("=", 1)
-                cookies[key.strip()] = value.strip()    
+                cookies[key.strip()] = value.strip()
         return cookies
+
+    def extract_credentials_from_body(self):
+        """Extract username/password from JSON or form-encoded request body."""
+        if not self.body:
+            return None
+
+        content_type = self.headers.get("Content-Type", "")
+
+        if "application/json" in content_type:
+            try:
+                payload = json.loads(self.body)
+            except (TypeError, ValueError):
+                return None
+
+            username = payload.get("username") or payload.get("user")
+            password = payload.get("password") or payload.get("pass")
+            if username and password:
+                return str(username), str(password)
+            return None
+
+        if "application/x-www-form-urlencoded" in content_type:
+            form = parse_qs(self.body, keep_blank_values=True)
+            username = form.get("username", [None])[0] or form.get("user", [None])[0]
+            password = form.get("password", [None])[0] or form.get("pass", [None])[0]
+            if username and password:
+                return str(username), str(password)
+
+        return None

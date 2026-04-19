@@ -152,13 +152,14 @@ Suggested helper script location:
   - Why must: assignment section 2.3 core functional requirements.
   - Done when: user sees joined channels and incoming updates, messages cannot be edited/deleted.
 
-- [ ] T14: Non-blocking communication among multi-daemons and peers
+- [x] T14: Non-blocking communication among multi-daemons and peers
   - Target: apply callback/coroutine/threading strategy consistently where required.
   - Spot: [daemon/backend.py](daemon/backend.py), [daemon/proxy.py](daemon/proxy.py), apps/chat/peer_service.py.
   - Why must: assignment section 2.1 and section 2.3 task requirements.
   - Done when: concurrency model selected and documented; communication stays responsive under multiple clients.
+  - Implemented decision: threading-first runtime used as stable default for backend/proxy/peer fan-out.
 
-- [ ] T15: Protocol design and message schema
+- [x] T15: Protocol design and message schema
   - Target: define message format, command types, and error payload structure.
   - Spot: apps/chat/protocol.py, docs/protocol.md.
   - Why must: assignment requires protocol design and processing procedure.
@@ -166,16 +167,16 @@ Suggested helper script location:
 
 ## Phase P2 - Reliability, Security, and Maintainability
 
-- [ ] T16: Robust host parsing and proxy error handling
+- [x] T16: Robust host parsing and proxy error handling
   - Target: safe handling for missing Host header or invalid route mapping.
   - Spot: [daemon/proxy.py](daemon/proxy.py).
   - Keep information: replaces dummy fallback with explicit 400/404 behavior.
 
-- [ ] T17: Request/response defensive coding
+- [x] T17: Request/response defensive coding
   - Target: malformed request handling, structured error responses, timeout handling.
   - Spot: [daemon/request.py](daemon/request.py), [daemon/httpadapter.py](daemon/httpadapter.py), [daemon/response.py](daemon/response.py).
 
-- [ ] T18: Security hardening for file serving
+- [x] T18: Security hardening for file serving
   - Target: prevent path traversal and unauthorized file access.
   - Spot: [daemon/response.py](daemon/response.py).
 
@@ -218,10 +219,80 @@ Suggested helper script location:
 
 ## 6) Deliverable Checklist Before Submission
 
-- [ ] Proxy, backend, and webapp processes can start and communicate.
-- [ ] Non-blocking mechanism is implemented and demonstrated.
-- [ ] Authentication (header + cookie) works.
-- [ ] Hybrid chat features (client-server + peer-to-peer) work.
-- [ ] Error handling and concurrency behavior are demonstrated.
-- [ ] Report includes protocol design and implementation notes.
+- [x] Proxy, backend, and webapp processes can start and communicate.
+- [x] Non-blocking mechanism is implemented and demonstrated.
+- [x] Authentication (header + cookie) works.
+- [x] Hybrid chat features (client-server + peer-to-peer) work.
+- [x] Error handling and concurrency behavior are demonstrated.
+- [x] Report includes protocol design and implementation notes.
 - [ ] Source follows coding style and submission packaging rules.
+
+## 7) Implementation Progress (2026-04-20)
+
+### 7.1 What was implemented
+
+- Core HTTP request lifecycle hardening:
+  - Robust request-line parsing, header/body split, Content-Length-aware reading, cookie/auth extraction.
+  - Files: [daemon/request.py](daemon/request.py), [daemon/httpadapter.py](daemon/httpadapter.py).
+- Response and static serving hardening:
+  - Deterministic status/header builder, correct Content-Length, Set-Cookie support, 400/401/404 handling.
+  - Safe static path resolution with traversal blocking.
+  - Files: [daemon/response.py](daemon/response.py).
+- Authentication and session control:
+  - HTTP Basic challenge (`WWW-Authenticate`) for protected routes.
+  - Session cookie issuance on successful login and session expiry via TTL.
+  - Thread-safe session store with remove/cleanup functions.
+  - Files: [daemon/httpadapter.py](daemon/httpadapter.py), [apps/auth/handlers.py](apps/auth/handlers.py), [apps/auth/session_store.py](apps/auth/session_store.py), [www/login.html](www/login.html).
+- Hybrid chat wiring and fixes:
+  - Added protocol envelope support and error schema.
+  - Fixed peer/channel forwarding logic and the previous channel broadcast argument mismatch.
+  - Added `/add-list` endpoint and standardized tracker/list behavior.
+  - Thread-safe peer/channel/tracker in-memory stores.
+  - Files: [apps/chat/protocol.py](apps/chat/protocol.py), [apps/chat/handlers.py](apps/chat/handlers.py), [apps/chat/peer_service.py](apps/chat/peer_service.py), [apps/chat/channel_service.py](apps/chat/channel_service.py), [apps/tracker/handlers.py](apps/tracker/handlers.py), [apps/tracker/registry.py](apps/tracker/registry.py), [apps/sampleapp.py](apps/sampleapp.py).
+- Proxy hardening:
+  - Missing Host handling (400), unmapped host handling (404), backend failure handling (502), timeout-based forwarding.
+  - Round-robin policy resolution for multiple upstreams.
+  - Files: [daemon/proxy.py](daemon/proxy.py), [start_proxy.py](start_proxy.py), [config/proxy.conf](config/proxy.conf).
+- Frontend behavior updates:
+  - Login form fetch-based auth flow with redirect to chat.
+  - Chat UI unauthorized redirect and fetch error handling.
+  - Files: [www/login.html](www/login.html), [static/js/chat-ui.js](static/js/chat-ui.js).
+- Circular import fix for runtime boot order:
+  - Lazy loading of sampleapp in package init.
+  - File: [apps/__init__.py](apps/__init__.py).
+
+### 7.2 How it works (secure/workable path)
+
+1. Client logs in using `POST /login`.
+2. Adapter validates credentials (JSON/form body or Authorization header).
+3. On success, server issues `Set-Cookie: session_id=...`.
+4. Protected routes (`/api/*`, tracker and peer control APIs, `/hello`, `/logout`) require valid session or valid Basic auth.
+5. Chat send flow writes immutable message objects to channel storage, then replicates to connected peers via protocol envelopes.
+6. Proxy routes requests by Host header and returns explicit status codes for bad/missing routing conditions.
+
+### 7.3 Verification evidence (executed)
+
+Executed with running processes:
+
+- sampleapp A: `127.0.0.1:2026`
+- sampleapp B: `127.0.0.1:2027`
+- backend: `127.0.0.1:9000`
+- proxy: `127.0.0.1:8080`
+
+Observed outputs:
+
+- `GET /chat.html` on sampleapp: `status=200`
+- `GET /api/channels` without auth: `status=401`
+- login with valid credentials: success JSON and cookie persisted
+- `GET /api/channels` with cookie: `[
+  "general", "networking", "random"
+]`
+- channel send/get messages: returned stored immutable message object with timestamp
+- peer connect and direct send (`/connect-peer`, `/send-peer`): returned `{"status": "sent"}`
+- proxy default host static (`Host: 127.0.0.1:8080`, `/index.html`): `status=200`
+- proxy app host login+channels (`Host: app1.local`): login success and channels returned
+
+### 7.4 Protocol design notes
+
+- Documented in [docs/protocol.md](docs/protocol.md).
+- Runtime constants and validation in [apps/chat/protocol.py](apps/chat/protocol.py).

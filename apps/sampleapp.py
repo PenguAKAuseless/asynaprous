@@ -19,21 +19,20 @@ app.sampleapp
 
 """
 
-import sys
-import os
-import importlib.util
 import json
+from urllib.parse import parse_qs
 
 from daemon import AsynapRous
-from .tracker.handlers import handle_submit_info, handle_get_list 
+from .tracker.handlers import handle_add_list, handle_get_list, handle_submit_info
 from .chat.handlers import (
-    handle_send_peer, 
-    handle_broadcast_peer, 
-    handle_connect_peer, 
-    handle_get_channels, 
-    handle_get_channel_msgs, 
+    handle_broadcast_peer,
+    handle_connect_peer,
+    handle_get_channel_msgs,
+    handle_get_channels,
+    handle_receive_channel_msg,
+    handle_receive_msg,
     handle_send_channel_msg,
-    handle_receive_channel_msg
+    handle_send_peer,
 )
 
 app = AsynapRous()
@@ -50,12 +49,27 @@ def login(headers="guest", body="anonymous"):
     :param headers (str): The request headers or user identifier.
     :param body (str): The request body or login payload.
     """
-    print("[SampleApp] Logging in {} to {}".format(headers, body))
-    data = {"message": "Welcome to the RESTful TCP WebApp"}
+    print("[SampleApp] Login request headers={} body={}".format(headers, body))
 
-    # Convert to JSON string
-    json_str = json.dumps(data)
-    return json_str.encode("utf-8")
+    username = "anonymous"
+    content_type = headers.get("Content-Type", "") if headers else ""
+
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(body)
+            username = payload.get("username") or payload.get("user") or username
+        except (TypeError, json.JSONDecodeError):
+            pass
+    elif "application/x-www-form-urlencoded" in content_type:
+        form = parse_qs(body, keep_blank_values=True)
+        username = form.get("username", [username])[0]
+
+    data = {
+        "status": "ok",
+        "message": "Welcome to the RESTful TCP WebApp",
+        "user": username,
+    }
+    return json.dumps(data)
 
 
 @app.route("/echo", methods=["POST"])
@@ -65,14 +79,10 @@ def echo(headers="guest", body="anonymous"):
     try:
         message = json.loads(body)
         data = {"received": message}
-        # Convert to JSON string
-        json_str = json.dumps(data)
-        return json_str.encode("utf-8")
+        return json.dumps(data)
     except json.JSONDecodeError:
         data = {"error": "Invalid JSON"}
-        # Convert to JSON string
-        json_str = json.dumps(data)
-        return json_str.encode("utf-8")
+        return json.dumps(data)
 
 
 @app.route("/hello", methods=["PUT"])
@@ -89,14 +99,17 @@ async def hello(headers, body):
     print("[SampleApp] ['PUT'] **ASYNC** Hello in {} to {}".format(headers, body))
     data = {"id": 1, "name": "Alice", "email": "alice@example.com"}
 
-    # Convert to JSON string
-    json_str = json.dumps(data)
-    return json_str.encode("utf-8")
+    return json.dumps(data)
 
 # from tracker/handlers.py
 @app.route("/submit-info", methods=["POST"])
 def submit_info(headers, body):
     return handle_submit_info(headers, body)
+
+
+@app.route("/add-list", methods=["POST"])
+def add_list(headers, body):
+    return handle_add_list(headers, body)
 
 @app.route("/get-list", methods=["GET"])
 def get_list(headers, body):
@@ -117,16 +130,7 @@ def connect_peer(headers, body):
 
 @app.route("/receive-msg", methods=["POST"])
 def receive_msg(headers, body):
-    try:
-        data = json.loads(body)
-        sender = data.get("from", "Unknown")
-        msg = data.get("msg", "")
-        print(f"\n[NEW MESSAGE] from {sender}: {msg}\n")
-        
-        response_data = {"status": "received"}
-        return json.dumps(response_data).encode("utf-8")
-    except json.JSONDecodeError:
-        return json.dumps({"status": "error", "message": "Invalid JSON"}).encode("utf-8")
+    return handle_receive_msg(headers, body)
 
 @app.route("/api/channels", methods=["GET"])
 def api_channels(headers, body):

@@ -14,40 +14,27 @@
 daemon.httpadapter
 ~~~~~~~~~~~~~~~~~
 
-This module provides a http adapter object to manage and persist
-http settings (headers, bodies). The adapter supports both
-raw URL paths and RESTful route definitions, and integrates with
-Request and Response objects to handle client-server communication.
+This module provides an HTTP adapter object to manage request parsing,
+authentication checks, route dispatch, and response delivery.
 """
-
-from .request import Request
-from .response import Response
-from .dictionary import CaseInsensitiveDict
-from apps.auth.handlers import check_credentials
-from apps.auth.session_store import get_session_user
 
 import asyncio
 import inspect
+import json
+
+from .request import Request
+from .response import Response
+from apps.auth.handlers import check_credentials
+from apps.auth.session_store import (
+    SESSION_TTL_SECONDS,
+    create_session,
+    get_session_user,
+    remove_session,
+)
+
 
 class HttpAdapter:
-    """
-    A mutable :class:`HTTP adapter <HTTP adapter>` for managing client connections
-    and routing requests.
-
-    The `HttpAdapter` class encapsulates the logic for receiving HTTP requests,
-    dispatching them to appropriate route handlers, and constructing responses.
-    It supports RESTful routing via hooks and integrates with :class:`Request <Request>`
-    and :class:`Response <Response>` objects for full request lifecycle management.
-
-    Attributes:
-        ip (str): IP address of the client.
-        port (int): Port number of the client.
-        conn (socket): Active socket connection.
-        connaddr (tuple): Address of the connected client.
-        routes (dict): Mapping of route paths to handler functions.
-        request (Request): Request object for parsing incoming data.
-        response (Response): Response object for building and sending replies.
-    """
+    """HTTP adapter for managing client connections and routing."""
 
     __attrs__ = [
         "ip",
@@ -60,286 +47,341 @@ class HttpAdapter:
     ]
 
     def __init__(self, ip, port, conn, connaddr, routes):
-        """
-        Initialize a new HttpAdapter instance.
-
-        :param ip (str): IP address of the client.
-        :param port (int): Port number of the client.
-        :param conn (socket): Active socket connection.
-        :param connaddr (tuple): Address of the connected client.
-        :param routes (dict): Mapping of route paths to handler functions.
-        """
-
-        #: IP address.
         self.ip = ip
-        #: Port.
         self.port = port
-        #: Connection
         self.conn = conn
-        #: Conndection address
         self.connaddr = connaddr
-        #: Routes
-        self.routes = routes
-        #: Request
+        self.routes = routes or {}
         self.request = Request()
-        #: Response
         self.response = Response()
 
+    def _read_http_message(self, conn, max_size=2 * 1024 * 1024):
+        """Read full HTTP request headers and body using Content-Length."""
+        conn.settimeout(10)
+        data = b""
+
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > max_size:
+                raise ValueError("Request too large")
+
+        if not data:
+            return ""
+
+        header_end = data.find(b"\r\n\r\n")
+        if header_end < 0:
+            return data.decode("utf-8", errors="replace")
+
+        header_blob = data[: header_end + 4]
+        body_blob = data[header_end + 4 :]
+
+        content_length = 0
+        header_text = header_blob.decode("iso-8859-1", errors="replace")
+        for line in header_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    content_length = int(line.split(":", 1)[1].strip())
+                except ValueError as exc:
+                    raise ValueError("Invalid Content-Length") from exc
+                break
+
+        while len(body_blob) < content_length:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            body_blob += chunk
+            if len(header_blob) + len(body_blob) > max_size:
+                raise ValueError("Request too large")
+
+        if content_length > 0:
+            body_blob = body_blob[:content_length]
+
+        full_request = header_blob + body_blob
+        return full_request.decode("utf-8", errors="replace")
+
+    async def _read_http_message_async(self, reader, max_size=2 * 1024 * 1024):
+        """Async variant for reading an HTTP request."""
+        data = b""
+
+        while b"\r\n\r\n" not in data:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > max_size:
+                raise ValueError("Request too large")
+
+        if not data:
+            return ""
+
+        header_end = data.find(b"\r\n\r\n")
+        if header_end < 0:
+            return data.decode("utf-8", errors="replace")
+
+        header_blob = data[: header_end + 4]
+        body_blob = data[header_end + 4 :]
+
+        content_length = 0
+        header_text = header_blob.decode("iso-8859-1", errors="replace")
+        for line in header_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                content_length = int(line.split(":", 1)[1].strip())
+                break
+
+        while len(body_blob) < content_length:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            body_blob += chunk
+            if len(header_blob) + len(body_blob) > max_size:
+                raise ValueError("Request too large")
+
+        if content_length > 0:
+            body_blob = body_blob[:content_length]
+
+        full_request = header_blob + body_blob
+        return full_request.decode("utf-8", errors="replace")
+
+    def _is_public_path(self, path):
+        """Return True for paths that do not require authentication."""
+        if path in {
+            "/",
+            "/index.html",
+            "/login",
+            "/login.html",
+            "/form.html",
+            "/echo",
+            "/chat.html",
+            "/receive-msg",
+            "/api/receive-channel",
+            "/favicon.ico",
+        }:
+            return True
+
+        return path.startswith("/css/") or path.startswith("/js/") or path.startswith(
+            "/images/"
+        )
+
+    def _is_protected_path(self, path):
+        """Return True for endpoints requiring valid session or valid auth header."""
+        if self._is_public_path(path):
+            return False
+
+        if path in {
+            "/submit-info",
+            "/add-list",
+            "/get-list",
+            "/connect-peer",
+            "/broadcast-peer",
+            "/send-peer",
+            "/hello",
+            "/logout",
+        }:
+            return True
+
+        return path.startswith("/api/")
+
+    def _build_internal_error(self, message="Internal Server Error"):
+        body = message.encode("utf-8")
+        response = (
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: {}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).format(len(body)).encode("utf-8")
+        return response + body
+
+    def _invoke_hook(self, req):
+        """Run route hook for sync and async handlers."""
+        kwargs = {"headers": req.headers, "body": req.body}
+
+        if inspect.iscoroutinefunction(req.hook):
+            return asyncio.run(req.hook(**kwargs))
+        return req.hook(**kwargs)
+
+    def _credentials_from_request(self, req):
+        """Extract credentials from body first, then fallback to Authorization."""
+        body_creds = req.extract_credentials_from_body()
+        if body_creds:
+            return body_creds
+
+        if isinstance(req.auth, tuple) and len(req.auth) == 2:
+            return req.auth
+
+        return None
+
+    def _authenticate_request(self, req):
+        """Validate session cookie or basic credentials for protected endpoints."""
+        session_id = req.cookies.get("session_id") if req.cookies else None
+        user_from_session = get_session_user(session_id)
+        if user_from_session:
+            return user_from_session
+
+        if isinstance(req.auth, tuple) and check_credentials(req.auth):
+            username = req.auth[0]
+            session_id = create_session(username)
+            self.response.set_cookie(
+                "session_id", session_id, max_age=SESSION_TTL_SECONDS, path="/"
+            )
+            return username
+
+        return None
+
+    def _handle_login(self, req):
+        """Process login with body/auth credentials and set session cookie."""
+        credentials = self._credentials_from_request(req)
+        if not credentials or not check_credentials(credentials):
+            return self.response.build_unauthorized()
+
+        username = credentials[0]
+        session_id = create_session(username)
+        self.response.set_cookie(
+            "session_id", session_id, max_age=SESSION_TTL_SECONDS, path="/"
+        )
+
+        if req.hook:
+            content = self._invoke_hook(req)
+        else:
+            content = json.dumps({"status": "ok", "message": "Login successful"})
+
+        return self.response.build_response(req, envelop_content=content)
+
+    def _handle_logout(self, req):
+        """Clear session state and instruct browser to remove cookie."""
+        session_id = req.cookies.get("session_id") if req.cookies else None
+        if session_id:
+            remove_session(session_id)
+
+        self.response.set_cookie("session_id", "deleted", max_age=0, path="/")
+        content = json.dumps({"status": "ok", "message": "Logged out"})
+        return self.response.build_response(req, envelop_content=content)
+
     def handle_client(self, conn, addr, routes):
-        """
-        Handle an incoming client connection.
-
-        This method reads the request from the socket, prepares the request object,
-        invokes the appropriate route handler if available, builds the response,
-        and sends it back to the client.
-
-        :param conn (socket): The client socket connection.
-        :param addr (tuple): The client's address.
-        :param routes (dict): The route mapping for dispatching requests.
-        """
-
-        # Connection handler.
+        """Handle an incoming client request in blocking mode."""
         self.conn = conn
-        # Connection address.
         self.connaddr = addr
-        # Request handler
+        self.routes = routes or {}
+
         req = self.request
-        # Response handler
         resp = self.response
 
-        # Handle the request
-        msg = conn.recv(1024).decode('utf-8')
-        if not msg: 
-            conn.close()
-            return
-        req.prepare(msg, routes)
-        print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
-        # Check cookie
-        session_id = req.cookies.get("session_id") if req.cookies else None
-        user_session = get_session_user(session_id)
-        
-        # Check authorization
-        auth_header = req.headers.get("Authorization")
-        req.prepare_auth(auth_header)
-                
-        # check login authentication for specific paths        
-        if req.path in ["/login", "/hello", "/login.html"]:
-            if not user_session and not check_credentials(req.auth):
-                print("[HttpAdapter] Authentication failed for {}".format(addr))
-                response = resp.build_unauthorized() 
-                conn.sendall(response)
-                conn.close()
+        try:
+            msg = self._read_http_message(conn)
+            if not msg:
                 return
-        # Handle request hook
-        if req.hook:
 
-            # TODO: handle for App hook here
+            req.prepare(msg, self.routes)
+            if not req.is_valid:
+                response = resp.build_bad_request(req.error or "400 Bad Request")
+                conn.sendall(response)
+                return
 
-            body = req.body
-            headers = req.headers
-            if inspect.iscoroutinefunction(req.hook):
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                content = loop.run_until_complete(req.hook(headers=headers, body=body))
+            req.prepare_auth(req.headers.get("Authorization"))
+
+            if req.path == "/login" and req.method == "POST":
+                response = self._handle_login(req)
+                conn.sendall(response)
+                return
+
+            if req.path == "/logout" and req.method in {"GET", "POST"}:
+                response = self._handle_logout(req)
+                conn.sendall(response)
+                return
+
+            if self._is_protected_path(req.path):
+                user = self._authenticate_request(req)
+                if not user:
+                    response = resp.build_unauthorized()
+                    conn.sendall(response)
+                    return
+
+            if req.hook:
+                content = self._invoke_hook(req)
+                response = resp.build_response(req, envelop_content=content)
             else:
-                content = req.hook(headers=headers, body=body)
-            response = resp.build_response(req, envelop_content=content)
-        else:
-            response = resp.build_notfound()
+                response = resp.build_response(req)
 
-        # print("[HttpAdapter] Response content {}".format(response))
-        conn.sendall(response)
-        conn.close()
+            conn.sendall(response)
+
+        except ValueError as exc:
+            conn.sendall(resp.build_bad_request(str(exc)))
+        except Exception:
+            conn.sendall(self._build_internal_error())
+        finally:
+            conn.close()
 
     async def handle_client_coroutine(self, reader, writer):
-        """
-        Handle an incoming client connection using stream reader writer asynchronously.
-
-        This method reads the request from the socket, prepares the request object,
-        invokes the appropriate route handler if available, builds the response,
-        and sends it back to the client.
-
-        :param conn (socket): The client socket connection.
-        :param addr (tuple): The client's address.
-        :param routes (dict): The route mapping for dispatching requests.
-        """
-        # Request handler
+        """Handle an incoming client request in async mode."""
         req = self.request
-        # Response handler
         resp = self.response
 
-        print(
-            "[HttpAdapter] Invoke handle_client_coroutine connection {})".format(addr)
-        )
-        addr = writer.get_extra_info("peername")
+        try:
+            msg = await self._read_http_message_async(reader)
+            if not msg:
+                writer.close()
+                await writer.wait_closed()
+                return
 
-        # TODO Handle the request asynchronously
-        msg = await reader.read(1024)
+            req.prepare(msg, routes=self.routes)
+            if not req.is_valid:
+                writer.write(resp.build_bad_request(req.error or "400 Bad Request"))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
 
-        # Parse luồng thông điệp
-        if not msg:
-            writer.close()
-            return
-            
-        req.prepare(msg.decode("utf-8"), routes=self.routes)
+            req.prepare_auth(req.headers.get("Authorization"))
 
-        # req.prepare(msg.decode("utf-8"), routes={})
+            if req.path == "/login" and req.method == "POST":
+                writer.write(self._handle_login(req))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
 
-        # Handle request hook
-        if req.hook:
-            
-            # TODO: handle for App hook here
-            
-            body = req.body
-            headers = req.headers
-            
-            if inspect.iscoroutinefunction(req.hook):
-                content = await req.hook(headers=headers, body=body)
+            if req.path == "/logout" and req.method in {"GET", "POST"}:
+                writer.write(self._handle_logout(req))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            if self._is_protected_path(req.path):
+                user = self._authenticate_request(req)
+                if not user:
+                    writer.write(resp.build_unauthorized())
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+            if req.hook:
+                if inspect.iscoroutinefunction(req.hook):
+                    content = await req.hook(headers=req.headers, body=req.body)
+                else:
+                    content = req.hook(headers=req.headers, body=req.body)
+                writer.write(resp.build_response(req, envelop_content=content))
             else:
-                content = req.hook(headers=headers, body=body)
+                writer.write(resp.build_response(req))
 
-            response = resp.build_response(req, envelop_content=content)
-        else:
-            response = resp.build_notfound()
+            await writer.drain()
 
-        # Build response
-        # print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
-        # response = resp.build_response(req)
-
-        # Send all the response asynchronously
-        writer.write(response)
-        await writer.drain()
-
-    @property
-    def extract_cookies(self, req, resp):
-        """
-        Build cookies from the :class:`Request <Request>` headers.
-
-        :param req:(Request) The :class:`Request <Request>` object.
-        :param resp: (Response) The res:class:`Response <Response>` object.
-        :rtype: cookies - A dictionary of cookie key-value pairs.
-        """
-        cookies = {}
-        for header in headers:
-            if header.startswith("Cookie:"):
-                cookie_str = header.split(":", 1)[1].strip()
-                for pair in cookie_str.split(";"):
-                    key, value = pair.strip().split("=")
-                    cookies[key] = value
-        return cookies
-
-    def build_response(self, req, resp):
-        """Builds a :class:`Response <Response>` object
-
-        :param req: The :class:`Request <Request>` used to generate the response.
-        :param resp: The  response object.
-        :rtype: Response
-        """
-        response = Response()
-
-        # Set encoding.
-        response.encoding = get_encoding_from_headers(response.headers)
-        response.raw = resp
-        response.reason = response.raw.reason
-
-        if isinstance(req.url, bytes):
-            response.url = req.url.decode("utf-8")
-        else:
-            response.url = req.url
-
-        # Add new cookies from the server.
-        response.cookies = extract_cookies(req)
-
-        # Give the Response some context.
-        response.request = req
-        response.connection = self
-
-        return response
-
-    def build_json_response(self, req, resp):
-        """Builds a :class:`Response <Response>` object from JSON data
-
-        :param req: The :class:`Request <Request>` used to generate the response.
-        :param resp: The  response object.
-        :rtype: Response
-        """
-        response = Response(req)
-
-        # Set encoding.
-        response.raw = resp
-
-        if isinstance(req.url, bytes):
-            response.url = req.url.decode("utf-8")
-        else:
-            response.url = req.url
-
-        # Give the Response some context.
-        response.request = req
-        response.connection = self
-
-        return response
-
-    # def get_connection(self, url, proxies=None):
-    # """Returns a url connection for the given URL.
-
-    # :param url: The URL to connect to.
-    # :param proxies: (optional) A Requests-style dictionary of proxies used on this request.
-    # :rtype: int
-    # """
-
-    # proxy = select_proxy(url, proxies)
-
-    # if proxy:
-    # proxy = prepend_scheme_if_needed(proxy, "http")
-    # proxy_url = parse_url(proxy)
-    # if not proxy_url.host:
-    # raise InvalidProxyURL(
-    # "Please check proxy URL. It is malformed "
-    # "and could be missing the host."
-    # )
-    # proxy_manager = self.proxy_manager_for(proxy)
-    # conn = proxy_manager.connection_from_url(url)
-    # else:
-    # # Only scheme should be lower case
-    # parsed = urlparse(url)
-    # url = parsed.geturl()
-    # conn = self.poolmanager.connection_from_url(url)
-
-    # return conn
+        except Exception:
+            writer.write(self._build_internal_error())
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     def add_headers(self, request):
-        """
-        Add headers to the request.
-
-        This method is intended to be overridden by subclasses to inject
-        custom headers. It does nothing by default.
-
-
-        :param request: :class:`Request <Request>` to add headers to.
-        """
-        pass
+        """Override point for custom request headers."""
+        _ = request
 
     def build_proxy_headers(self, proxy):
-        """Returns a dictionary of the headers to add to any request sent
-        through a proxy.
-
-        :class:`HttpAdapter <HttpAdapter>`.
-
-        :param proxy: The url of the proxy being used for this request.
-        :rtype: dict
-        """
-        headers = {}
-        
-        # TODO: build your authentication here
-        #       username, password =...
-        # we provide dummy auth here
-        
-        username, password = ("user1", "password")
-
-        if username:
-            headers["Proxy-Authorization"] = (username, password)
-
-        return headers
+        """Build extra headers for requests forwarded through proxy."""
+        _ = proxy
+        return {}

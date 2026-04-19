@@ -1,26 +1,37 @@
-# apps/chat/peer_service.py
+"""Thread-safe storage for known peer endpoints."""
 
-# { "peer_id": socket_connection }
-# _connected_peers = {}
-
-# def add_connection(peer_id, connection):
-#     _connected_peers[peer_id] = connection
-#     return True
-
-# def get_all_connections():
-#     return _connected_peers
-
-# -- 
-# Lưu trữ thông tin logic: { "peer_id": {"ip": "...", "port": ...} } - Không lưu connection  - vì khi http conc đóng thì chết.
+import threading
 
 _connected_peers = {}
+_peer_lock = threading.Lock()
+
 
 def add_peer_info(peer_id, ip, port):
-    _connected_peers[peer_id] = {"ip": ip, "port": int(port)}
+    """Add or update peer endpoint information."""
+    if not peer_id or not ip or port is None:
+        return False
+
+    try:
+        safe_port = int(port)
+    except (TypeError, ValueError):
+        return False
+
+    if safe_port <= 0 or safe_port > 65535:
+        return False
+
+    with _peer_lock:
+        _connected_peers[str(peer_id)] = {"ip": str(ip), "port": safe_port}
     return True
 
+
 def get_peer_info(peer_id):
-    return _connected_peers.get(peer_id)
+    """Return endpoint info for one peer id."""
+    with _peer_lock:
+        info = _connected_peers.get(str(peer_id))
+        return dict(info) if info else None
+
 
 def get_all_peers():
-    return _connected_peers
+    """Return a copy of all connected peers."""
+    with _peer_lock:
+        return dict(_connected_peers)

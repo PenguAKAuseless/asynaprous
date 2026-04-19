@@ -114,10 +114,8 @@ async def handle_client_coroutine(reader, writer):
         )
     )
 
-    # Handle client in asynchronous mode
-    while True:
-        daemon = HttpAdapter(None, None, None, None, None)
-        await daemon.handle_client_coroutine(reader, writer)
+    daemon = HttpAdapter(None, None, None, None, None)
+    await daemon.handle_client_coroutine(reader, writer)
 
 
 async def async_server(ip="0.0.0.0", port=7000, routes={}):
@@ -201,7 +199,8 @@ def run_backend(ip, port, routes):
                     callback, ip, port, routes = key.data
                     # Accept connection
                     conn, addr = key.fileobj.accept()
-                    conn.setblocking(False)
+                    # Adapter uses regular recv loop, so keep client socket blocking.
+                    conn.setblocking(True)
                     # Invoke the callback to handle the client connection
                     callback(key.fileobj, ip, port, conn, addr, routes)
 

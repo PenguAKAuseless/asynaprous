@@ -2,16 +2,33 @@ let currentChannel = "general";
 let localMessageCount = 0;
 
 async function loadChannels() {
-    // using async: fetch(): network request - need data from BE
-    const res = await fetch("/api/channels");               // async --> await - wait response from BE before proceeding
-    const channels = await res.json();
-    const list = document.getElementById("channel-list");   // get channel list element
-    channels.forEach(c => {                                 
+    try {
+        const res = await fetch("/api/channels");
+        if (res.status === 401) {
+            window.location.href = "/login.html";
+            return;
+        }
+        if (!res.ok) {
+            throw new Error("Unable to load channels");
+        }
+
+        const channels = await res.json();
+        const list = document.getElementById("channel-list");
+        list.replaceChildren();
+
+        channels.forEach(c => {
         let li = document.createElement("li");
         li.textContent = "# " + c;
         li.onclick = () => selectChannel(c);
         list.appendChild(li);
-    });
+        });
+
+        if (channels.length > 0) {
+            selectChannel(channels[0]);
+        }
+    } catch (error) {
+        console.error("loadChannels failed", error);
+    }
 }
 /*----example
     channels is an array like ["general", "networking"].
@@ -37,19 +54,33 @@ function selectChannel(channel) {
 */
 
 async function pollMessages() {
-    const res = await fetch("/api/get-messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: currentChannel })
-    });
-    const messages = await res.json();
-    
-    if (messages.length > localMessageCount) {
-        if (localMessageCount !== 0) {
-            console.log("New message notification triggered!");
+    try {
+        const res = await fetch("/api/get-messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ channel: currentChannel })
+        });
+
+        if (res.status === 401) {
+            window.location.href = "/login.html";
+            return;
         }
-        localMessageCount = messages.length;
-        renderMessages(messages);
+
+        if (!res.ok) {
+            throw new Error("Unable to poll messages");
+        }
+
+        const messages = await res.json();
+
+        if (messages.length > localMessageCount) {
+            if (localMessageCount !== 0) {
+                console.log("New message notification triggered!");
+            }
+            localMessageCount = messages.length;
+            renderMessages(messages);
+        }
+    } catch (error) {
+        console.error("pollMessages failed", error);
     }
 }
 /*
@@ -99,14 +130,27 @@ async function sendMessage() {
     const msg = input.value.trim();
     if (!msg) return;
 
-    await fetch("/api/send-channel", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: currentChannel, message: msg, sender: "me" })
-    });
-    
-    input.value = "";
-    pollMessages(); // Fetch immediately after sending
+    try {
+        const res = await fetch("/api/send-channel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ channel: currentChannel, message: msg, sender: "me" })
+        });
+
+        if (res.status === 401) {
+            window.location.href = "/login.html";
+            return;
+        }
+
+        if (!res.ok) {
+            throw new Error("Unable to send message");
+        }
+
+        input.value = "";
+        pollMessages();
+    } catch (error) {
+        console.error("sendMessage failed", error);
+    }
 }
 /*
     find textbox element, get message, trim whitespace, if empty return
@@ -118,5 +162,5 @@ async function sendMessage() {
 // Short polling every 2 seconds to check BE new messages - Notification system
 window.onload = () => {
     loadChannels();
-    setInterval(pollMessages, 2000); 
+    setInterval(pollMessages, 2000);
 };
