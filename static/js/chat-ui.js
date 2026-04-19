@@ -64,22 +64,36 @@ async function pollMessages() {
 
 function renderMessages(messages) {
     const container = document.getElementById("messages");
-    container.innerHTML = "";
+    container.replaceChildren();
     messages.forEach(m => {
         let div = document.createElement("div");
         div.className = "msg";
-        div.innerHTML = `<span class="msg-time">[${m.timestamp}]</span> 
-                         <span class="msg-sender">${m.sender}:</span> ${m.message}`;
+
+        let timeSpan = document.createElement("span");
+        timeSpan.className = "msg-time";
+        timeSpan.textContent = `[${m.timestamp}]`;
+
+        let senderSpan = document.createElement("span");
+        senderSpan.className = "msg-sender";
+        senderSpan.textContent = `${m.sender}:`;
+
+        div.appendChild(timeSpan);
+        div.appendChild(document.createTextNode(" "));
+        div.appendChild(senderSpan);
+        div.appendChild(document.createTextNode(" "));
+        div.appendChild(document.createTextNode(m.message));
+
         container.appendChild(div);
     });
     container.scrollTop = container.scrollHeight;
 }
 /*
     find id of message which is ready to show
-    clear old messages - avoid duplicate
-    loop: create a new <div> for each message and append it to the container
+    remove all old message container - replaceChildren() 
+    loop: create timestamp span, sender span, append to message div, append message div to container
     scroll to bottom - always show the latest message
 */
+
 async function sendMessage() {
     const input = document.getElementById("msg-input");
     const msg = input.value.trim();
