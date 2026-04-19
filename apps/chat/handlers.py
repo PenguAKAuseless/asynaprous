@@ -1,6 +1,7 @@
 import json
 import socket
 from .peer_service import add_peer_info, get_all_peers, get_peer_info
+from .channel_service import get_channels, get_messages, add_message
 
 def _send_http_post(target_ip, target_port, payload):
     """
@@ -68,3 +69,21 @@ def handle_broadcast_peer(headers, body):
         if _send_http_post(info['ip'], info['port'], {"from": "me", "msg": message}):
             count += 1
     return json.dumps({"status": "broadcast_done", "delivered": count})
+
+# You can add more handlers for channel management, message retrieval, etc. here.
+def handle_get_channels(headers, body):
+    return json.dumps(get_channels())
+
+def handle_get_channel_msgs(headers, body):
+    data = json.loads(body)
+    channel = data.get("channel", "general")
+    return json.dumps(get_messages(channel))
+
+def handle_send_channel_msg(headers, body):
+    data = json.loads(body)
+    channel = data.get("channel", "general")
+    msg = data.get("message", "")
+    sender = data.get("sender", "me")
+    
+    add_message(channel, sender, msg)
+    return json.dumps({"status": "ok"})

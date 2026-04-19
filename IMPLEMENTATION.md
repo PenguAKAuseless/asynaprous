@@ -139,7 +139,7 @@ Suggested helper script location:
   - Why must: assignment section 2.3 initialization phase.
   - Done when: peers can register, list active peers, and discover endpoints.
 
-- [ ] T12: Peer-to-peer live messaging APIs
+- [x] T12: Peer-to-peer live messaging APIs
   - Target: direct and broadcast messaging between peers.
   - Spot: apps/chat/handlers.py, apps/chat/peer_service.py.
   - Required APIs: /connect-peer, /broadcast-peer, /send-peer.
