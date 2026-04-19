@@ -10,7 +10,8 @@
 # while attending the course
 #
 
-from collections import MutableMapping
+# from collections import MutableMapping
+from collections.abc import MutableMapping
 
 
 class CaseInsensitiveDict(MutableMapping):

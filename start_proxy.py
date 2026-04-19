@@ -80,21 +80,24 @@ def parse_virtual_hosts(config_file):
         else:  # default policy is round_robin
             dist_policy_map = "round-robin"
 
-        #
         # @bksysnet: Build the mapping and policy
         # TODO: this policy varies among scenarios
         #       the default policy is provided with one proxy_pass
         #       In the multi alternatives of proxy_pass then
         #       the policy is applied to identify the highes matching
         #       proxy_pass
-        #
-        if len(proxy_map.get(host, [])) == 1:
-            routes[host] = (proxy_map.get(host, [])[0], dist_policy_map)
+        
+        # if len(proxy_map.get(host, [])) == 1:
+        passes = proxy_map.get(host, [])
+        if len(passes) > 0:
+            # { hostname: ( [list_of_backends], policy_name ) }
+            routes[host] = (passes, dist_policy_map)
+            # routes[host] = (proxy_map.get(host, [])[0], dist_policy_map)  --> TRẢ VỀ STRING
         # esle if:
         #         TODO:  apply further policy matching here
-        #
+        
         else:
-            routes[host] = (proxy_map.get(host, []), dist_policy_map)
+            routes[host] = (passes, dist_policy_map)    # --> TRẢ VỀ LIST
 
     for key, value in routes.items():
         print(key, value)

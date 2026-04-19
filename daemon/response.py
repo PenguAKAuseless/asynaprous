@@ -26,7 +26,10 @@ import os
 import mimetypes
 from .dictionary import CaseInsensitiveDict
 
-BASE_DIR = ""
+# find directory 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/"
+
+# BASE_DIR = ""
 
 
 class Response:
@@ -127,7 +130,14 @@ class Response:
 
         :rtype str: MIME type string (e.g., 'text/html', 'image/png').
         """
-
+        path_lower = path.lower()
+        if path_lower.endswith(".html"):
+            return "text/html"
+        if path_lower.endswith(".css"):
+            return "text/css"
+        if path_lower.endswith(".js"):
+            return "application/javascript"
+        
         try:
             mime_type, _ = mimetypes.guess_type(path)
         except Exception:
@@ -164,25 +174,26 @@ class Response:
             elif sub_type == "html":
                 base_dir = BASE_DIR + "www/"
             else:
-                handle_text_other(sub_type)
+                # text/csv, text/xml --> static/
+                base_dir = BASE_DIR + "static/" 
+                
         elif main_type == "image":
             base_dir = BASE_DIR + "static/"
             self.headers["Content-Type"] = "image/{}".format(sub_type)
+            
         elif main_type == "application":
-            base_dir = BASE_DIR + "apps/"
             self.headers["Content-Type"] = "application/{}".format(sub_type)
-        #
+            if sub_type in ["xml", "zip", "pdf", "javascript", "x-javascript"]:
+                base_dir = BASE_DIR + "static/"
+            else:
+                base_dir = BASE_DIR + "apps/"
+        
         #  TODO: process other mime_type
-        #        application/xml
-        #        application/zip
-        #        ...
-        #        text/csv
-        #        text/xml
-        #        ...
-        #        video/mp4
-        #        video/mpeg
-        #        ...
-        #
+        
+        elif main_type in ["video", "audio"]:
+            self.headers["Content-Type"] = "{}/{}".format(main_type, sub_type)
+            base_dir = BASE_DIR + "static/"
+        
         else:
             raise ValueError(
                 "Invalid MEME type: main_type={} sub_type={}".format(
@@ -226,6 +237,12 @@ class Response:
 
         :rtypes bytes: encoded HTTP response header.
         """
+        # Status line: 200 OK is default
+        status_code = self.status_code or 200
+        reason = self.reason or "OK"
+        state_line = "HTTP/1.1 {} {}\r\n".format(status_code, reason)
+        
+        # Get header of request
         reqhdr = request.headers
         rsphdr = self.headers
 
@@ -254,16 +271,20 @@ class Response:
             "Proxy-Authorization": "Basic dXNlcjpwYXNz",  # example base64
             "Warning": "199 Miscellaneous warning",
             "User-Agent": "{}".format(reqhdr.get("User-Agent", "Chrome/123.0.0.0")),
+            "Connection": "close", 
         }
 
         # Header text alignment
-        #
         #  TODO: implement the header building to create formated
         #        header from the provied headers
-        #
-        #
+        
+        fmt_header = state_line
+        for key, value in headers.items():
+            fmt_header += "{}: {}\r\n".format(key, value)
+        fmt_header += "\r\n"
+        
         # TODO prepare the request authentication
-        #
+        
         # self.auth = ...
 
         return str(fmt_header).encode("utf-8")
@@ -297,6 +318,10 @@ class Response:
         print("[Response] Start build response with req {}".format(request))
 
         path = request.path
+        
+        # Default to index.html if path is root
+        if path == "/" or path == "":
+            path = "/index.html"
 
         mime_type = self.get_mime_type(path)
         print(
@@ -304,22 +329,76 @@ class Response:
                 request.method, request.path, mime_type
             )
         )
-
-        base_dir = ""
-
-        # If HTML, parse and serve embedded objects
-        if path.endswith(".html") or mime_type == "text/html":
-            base_dir = self.prepare_content_type(mime_type="text/html")
-        elif mime_type == "text/css":
-            base_dir = self.prepare_content_type(mime_type="text/css")
-        elif mime_type == "application/json" or mime_type == "application/octet-stream":
-            base_dir = self.prepare_content_type(mime_type="application/json")
-            envelop_content = ""
-
-        #
-        # TODO: add support objects
-        #
+        
+        # body
+        # Xử lý nội dung động (REST API / WebApp)
+        if envelop_content is not None:
+            self._content = envelop_content.encode("utf-8") if isinstance(envelop_content, str) else envelop_content
+            # if not set content-type, default to application/json
+            if "Content-Type" not in self.headers:
+                self.headers["Content-Type"] = "application/json"
         else:
-            return self.build_notfound()
+            # Xử lý nội dung tĩnh (HTML, CSS, JS, images, etc.)
+            base_dir = self.prepare_content_type(mime_type)
+            length, content = self.build_content(path, base_dir)
+            
+            if length < 0:
+                return self.build_notfound()
+            self._content = content
+
+        # Redundant - Have done in prepare_content_type
+        # # If HTML, parse and serve embedded objects
+        # if path.endswith(".html") or mime_type == "text/html":
+        #     base_dir = self.prepare_content_type(mime_type="text/html")
+        # elif mime_type == "text/css":
+        #     base_dir = self.prepare_content_type(mime_type="text/css")
+        # elif mime_type == "application/json" or mime_type == "application/octet-stream":
+        #     base_dir = self.prepare_content_type(mime_type="application/json")
+        #     envelop_content = ""
+        
+        # TODO: add support objects
+        
+        # else:
+        #     return self.build_notfound()
+        
+        self._header = self.build_response_header(request)
 
         return self._header + self._content
+
+    # Helper function
+    def build_unauthorized(self, realm="AsynapRous"):
+        """
+        401 Let user know they must login (unauthorized)
+        create a standard 401 Unauthorized HTTP response with a WWW-Authenticate header.
+        www-authenticate header is compulsory for the browser to display the login.
+        realm is label, displayed on login form to let user know where they are.
+
+        Args:
+            realm (str, optional): _description_. Defaults to "AsynapRous".
+        """
+        self.status_code = 401
+        self.reason = "Unauthorized"
+        
+        auth_header = 'WWW-Authenticate: Basic realm="{}"\r\n'.format(realm)
+        
+        # Raw HTTP Response
+        response_line = "HTTP/1.1 401 Unauthorized\r\n"
+        headers = (
+            "WWW-Authenticate: {}\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: 25\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).format(auth_header)
+        
+        body = "<h1>401 Unauthorized</h1>"
+        
+        return (response_line + headers + body).encode("utf-8")
+    
+    def set_cookie (self, key, value, max_age=3600, path="/"):
+        cookie_str = "{}={}; Max-Age={}; Path={}".format(key, value, max_age, path)
+        if "Set-Cookie" not in self.headers:
+            self.headers["Set-Cookie"] = cookie_str
+        else:
+            # Hỗ trợ nhiều cookie bằng cách gộp lại hoặc dùng list (tùy framework)
+            self.headers["Set-Cookie"] += "\\r\\nSet-Cookie: " + cookie_str

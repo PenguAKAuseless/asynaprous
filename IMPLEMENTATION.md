@@ -88,31 +88,31 @@ Suggested helper script location:
   - Why must: headers/hook/body state currently incomplete and can crash.
   - Done when: Request object consistently contains method/path/version/headers/body/cookies/hook.
 
-- [ ] T04: Execute route handlers for sync and async functions
+- [x] T04: Execute route handlers for sync and async functions
   - Target: AsynapRous handlers are actually invoked and returned payload used.
   - Spot: [daemon/httpadapter.py](daemon/httpadapter.py), [apps/sampleapp.py](apps/sampleapp.py).
   - Why must: hooks are discovered but not executed correctly.
   - Done when: POST /login, POST /echo, PUT /hello return valid HTTP responses.
 
-- [ ] T05: Build valid HTTP response bytes
+- [x] T05: Build valid HTTP response bytes
   - Target: full response = status line + headers + CRLF + body.
   - Spot: [daemon/response.py](daemon/response.py).
   - Why must: undefined symbols and incomplete header formatting block serving.
   - Done when: header builder is deterministic; Content-Length is correct; bytes sent are browser-compatible.
 
-- [ ] T06: Static object serving correctness
+- [x] T06: Static object serving correctness
   - Target: serve html/css/js/images from runtime folders.
   - Spot: [daemon/response.py](daemon/response.py), [www/index.html](www/index.html), [static/css/styles.css](static/css/styles.css).
   - Why must: assignment demo needs web pages and static assets.
   - Done when: /index.html and referenced CSS/images load with proper MIME type.
 
-- [ ] T07: Proxy route policy resolution and multi-upstream behavior
+- [x] T07: Proxy route policy resolution and multi-upstream behavior
   - Target: parse and apply dist_policy with multiple proxy_pass entries.
   - Spot: [start_proxy.py](start_proxy.py), [daemon/proxy.py](daemon/proxy.py), [config/proxy.conf](config/proxy.conf).
   - Why must: route resolver has undefined variable path and incomplete policy handling.
   - Done when: single-upstream and multi-upstream hosts forward predictably (round-robin baseline).
 
-- [ ] T08: Python compatibility blockers
+- [x] T08: Python compatibility blockers
   - Target: modern import compatibility and utility correctness.
   - Spot: [daemon/utils.py](daemon/utils.py), [daemon/dictionary.py](daemon/dictionary.py).
   - Why must: legacy imports can break execution.
@@ -120,33 +120,33 @@ Suggested helper script location:
 
 ## Phase P1 - Assignment-Mandatory Features
 
-- [ ] T09: HTTP authentication via headers
+- [x] T09: HTTP authentication via headers
   - Target: RFC-inspired auth flow with WWW-Authenticate and Authorization support.
   - Spot: [daemon/request.py](daemon/request.py), [daemon/response.py](daemon/response.py), [daemon/httpadapter.py](daemon/httpadapter.py), apps/auth/handlers.py.
   - Why must: assignment section 2.2 requires authentication mechanism.
   - Done when: unauthorized request returns 401 + challenge; valid credentials allow access.
 
-- [ ] T10: Cookie-based authentication/session tracking
+- [x] T10: Cookie-based authentication/session tracking
   - Target: Set-Cookie and Cookie parsing and access control.
   - Spot: [daemon/request.py](daemon/request.py), [daemon/response.py](daemon/response.py), apps/auth/session_store.py.
   - Why must: assignment explicitly requests cookie handling and access control.
   - Done when: login issues cookie and protected endpoints validate session cookie.
 
-- [ ] T11: Client-server initialization APIs for hybrid chat
+- [x] T11: Client-server initialization APIs for hybrid chat
   - Target: implement peer registration/tracker APIs.
   - Spot: apps/tracker/handlers.py, apps/tracker/registry.py, [daemon/httpadapter.py](daemon/httpadapter.py).
   - Required APIs: /submit-info, /add-list, /get-list.
   - Why must: assignment section 2.3 initialization phase.
   - Done when: peers can register, list active peers, and discover endpoints.
 
-- [ ] T12: Peer-to-peer live messaging APIs
+- [x] T12: Peer-to-peer live messaging APIs
   - Target: direct and broadcast messaging between peers.
   - Spot: apps/chat/handlers.py, apps/chat/peer_service.py.
   - Required APIs: /connect-peer, /broadcast-peer, /send-peer.
   - Why must: assignment section 2.3 peer chatting phase.
   - Done when: peer can connect, send direct message, and broadcast to connected peers.
 
-- [ ] T13: Channel management behaviors
+- [x] T13: Channel management behaviors
   - Target: channel list, message view, submit, notifications, immutable messages.
   - Spot: apps/chat/channel_service.py, frontend/pages/chat.html, frontend/assets/js/chat-ui.js.
   - Why must: assignment section 2.3 core functional requirements.

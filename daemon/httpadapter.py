@@ -23,10 +23,11 @@ Request and Response objects to handle client-server communication.
 from .request import Request
 from .response import Response
 from .dictionary import CaseInsensitiveDict
+from apps.auth.handlers import check_credentials
+from apps.auth.session_store import get_session_user
 
 import asyncio
 import inspect
-
 
 class HttpAdapter:
     """
@@ -108,9 +109,27 @@ class HttpAdapter:
 
         # Handle the request
         msg = conn.recv(1024).decode('utf-8')
+        if not msg: 
+            conn.close()
+            return
         req.prepare(msg, routes)
         print("[HttpAdapter] Invoke handle_client connection {}".format(addr))
-
+        # Check cookie
+        session_id = req.cookies.get("session_id") if req.cookies else None
+        user_session = get_session_user(session_id)
+        
+        # Check authorization
+        auth_header = req.headers.get("Authorization")
+        req.prepare_auth(auth_header)
+                
+        # check login authentication for specific paths        
+        if req.path in ["/login", "/hello", "/login.html"]:
+            if not user_session and not check_credentials(req.auth):
+                print("[HttpAdapter] Authentication failed for {}".format(addr))
+                response = resp.build_unauthorized() 
+                conn.sendall(response)
+                conn.close()
+                return
         # Handle request hook
         if req.hook:
 
@@ -174,8 +193,8 @@ class HttpAdapter:
             
             # TODO: handle for App hook here
             
-            body = getattr(req, 'body', '')
-            headers = getattr(req, 'headers', {})
+            body = req.body
+            headers = req.headers
             
             if inspect.iscoroutinefunction(req.hook):
                 content = await req.hook(headers=headers, body=body)
@@ -188,7 +207,7 @@ class HttpAdapter:
 
         # Build response
         # print("[HttpAdapter] Start **ASYNC** build_response with type {}".format(type(req)))
-        response = resp.build_response(req)
+        # response = resp.build_response(req)
 
         # Send all the response asynchronously
         writer.write(response)
@@ -313,11 +332,11 @@ class HttpAdapter:
         :rtype: dict
         """
         headers = {}
-        #
+        
         # TODO: build your authentication here
         #       username, password =...
         # we provide dummy auth here
-        #
+        
         username, password = ("user1", "password")
 
         if username:

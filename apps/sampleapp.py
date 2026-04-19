@@ -25,6 +25,16 @@ import importlib.util
 import json
 
 from daemon import AsynapRous
+from .tracker.handlers import handle_submit_info, handle_get_list 
+from .chat.handlers import (
+    handle_send_peer, 
+    handle_broadcast_peer, 
+    handle_connect_peer, 
+    handle_get_channels, 
+    handle_get_channel_msgs, 
+    handle_send_channel_msg,
+    handle_receive_channel_msg
+)
 
 app = AsynapRous()
 
@@ -83,6 +93,56 @@ async def hello(headers, body):
     json_str = json.dumps(data)
     return json_str.encode("utf-8")
 
+# from tracker/handlers.py
+@app.route("/submit-info", methods=["POST"])
+def submit_info(headers, body):
+    return handle_submit_info(headers, body)
+
+@app.route("/get-list", methods=["GET"])
+def get_list(headers, body):
+    return handle_get_list(headers, body)
+
+# from chat/handlers.py
+@app.route("/send-peer", methods=["POST"])
+def send_peer(headers, body):
+    return handle_send_peer(headers, body)
+
+@app.route("/broadcast-peer", methods=["POST"])
+def broadcast_peer(headers, body):
+    return handle_broadcast_peer(headers, body)
+
+@app.route("/connect-peer", methods=["POST"])
+def connect_peer(headers, body):
+    return handle_connect_peer(headers, body)
+
+@app.route("/receive-msg", methods=["POST"])
+def receive_msg(headers, body):
+    try:
+        data = json.loads(body)
+        sender = data.get("from", "Unknown")
+        msg = data.get("msg", "")
+        print(f"\n[NEW MESSAGE] from {sender}: {msg}\n")
+        
+        response_data = {"status": "received"}
+        return json.dumps(response_data).encode("utf-8")
+    except json.JSONDecodeError:
+        return json.dumps({"status": "error", "message": "Invalid JSON"}).encode("utf-8")
+
+@app.route("/api/channels", methods=["GET"])
+def api_channels(headers, body):
+    return handle_get_channels(headers, body)
+
+@app.route("/api/get-messages", methods=["POST"])
+def api_get_messages(headers, body):
+    return handle_get_channel_msgs(headers, body)
+
+@app.route("/api/send-channel", methods=["POST"])
+def api_send_channel(headers, body):
+    return handle_send_channel_msg(headers, body)
+
+@app.route("/api/receive-channel", methods=["POST"])
+def api_receive_channel(headers, body):
+    return handle_receive_channel_msg(headers, body)
 
 def create_sampleapp(ip, port):
     # Prepare and launch the RESTful application
