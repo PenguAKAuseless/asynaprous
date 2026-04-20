@@ -18,6 +18,9 @@ load_dotenv()
 _db_lock = threading.Lock()
 _initialized = False
 
+_PRIVATE_ROOM_PREFIX = "private::"
+_PRIVATE_OWNER_MARKER = "::owner::"
+
 
 def _connect():
     db_path = get_db_path()
@@ -46,6 +49,29 @@ def _safe_peer_list(peer_ids):
 
 def _direct_room_id(owner_username, peer_id):
     return "direct::{}::{}".format(owner_username, peer_id)
+
+
+def to_shared_private_room_id(room_id):
+    """Return canonical private room id from owner-scoped room id."""
+    safe_room = str(room_id or "").strip()
+    if not safe_room.startswith(_PRIVATE_ROOM_PREFIX):
+        return safe_room
+
+    marker_index = safe_room.find(_PRIVATE_OWNER_MARKER)
+    if marker_index < 0:
+        return safe_room
+
+    return safe_room[:marker_index]
+
+
+def _local_private_room_id(owner_username, room_id):
+    """Build owner-scoped private room id to avoid global PK collisions."""
+    safe_owner = str(owner_username or "").strip()
+    shared_room = to_shared_private_room_id(room_id)
+    if not safe_owner or not shared_room.startswith(_PRIVATE_ROOM_PREFIX):
+        return shared_room
+
+    return "{}{}{}".format(shared_room, _PRIVATE_OWNER_MARKER, safe_owner)
 
 
 def initialize_p2p_store():
@@ -198,11 +224,13 @@ def create_private_room(owner_username, room_name, peer_ids):
     if not peers:
         return False, "Select at least one peer", None
 
-    room_id = "private::{}".format(uuid.uuid4())
+    shared_room_id = "private::{}".format(uuid.uuid4())
+    room_id = _local_private_room_id(safe_owner, shared_room_id)
     _upsert_room(safe_owner, room_id, safe_name, peers)
 
     return True, "created", {
         "room_id": room_id,
+        "shared_room_id": shared_room_id,
         "room_name": safe_name,
         "peers": peers,
         "type": "private",
@@ -322,6 +350,28 @@ def get_room(owner_username, room_id):
         return None
 
     return _room_row_to_dict(row)
+
+
+def upsert_room_for_owner(owner_username, room_id, room_name, peer_ids):
+    """Create or update a room definition for one owner and return descriptor."""
+    initialize_p2p_store()
+
+    safe_owner = str(owner_username or "").strip()
+    safe_room = str(room_id or "").strip()
+    safe_name = str(room_name or "").strip()
+    peers = _safe_peer_list(peer_ids)
+
+    if not safe_owner or not safe_room or not peers:
+        return None
+
+    if safe_room.startswith(_PRIVATE_ROOM_PREFIX):
+        safe_room = _local_private_room_id(safe_owner, safe_room)
+
+    if not safe_name:
+        safe_name = "Private Conversation"
+
+    _upsert_room(safe_owner, safe_room, safe_name, peers)
+    return get_room(safe_owner, safe_room)
 
 
 def rename_room(owner_username, room_id, new_room_name):

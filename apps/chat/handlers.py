@@ -5,6 +5,7 @@ import socket
 import threading
 import ssl
 import os
+import ipaddress
 
 from .channel_service import (
     add_message,
@@ -28,8 +29,14 @@ from .p2p_store import (
     leave_room,
     list_rooms,
     rename_room,
+    to_shared_private_room_id,
+    upsert_room_for_owner,
 )
-from apps.tracker.registry import get_all_peers as get_tracker_peers
+from apps.tracker.registry import (
+    get_all_peers as get_tracker_peers,
+    register_peer as register_tracker_peer,
+)
+from apps.auth.account_store import get_peer_id_for_user, get_username_for_peer_id
 from .protocol import (
     COMMAND_BROADCAST_PEER,
     COMMAND_CHANNEL_MESSAGE,
@@ -58,6 +65,83 @@ def _authenticated_user(headers):
     if not headers:
         return ""
     return str(headers.get("X-Authenticated-User", "")).strip()
+
+
+def _parse_host_ip_port(headers):
+    """Extract reachable host and port from Host header."""
+    if not headers:
+        return "", 0
+
+    raw_host = str(headers.get("Host", "") or "").strip()
+    if not raw_host:
+        return "", 0
+
+    host = raw_host.split(",", 1)[0].strip()
+    if not host:
+        return "", 0
+
+    host_ip = ""
+    host_port = 0
+
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return "", 0
+        host_ip = host[1:end].strip()
+        tail = host[end + 1 :].strip()
+        if not tail.startswith(":"):
+            return "", 0
+        port_text = tail[1:].strip()
+    else:
+        if ":" not in host:
+            return "", 0
+        host_ip, port_text = host.rsplit(":", 1)
+        host_ip = host_ip.strip()
+
+    try:
+        host_port = int(port_text)
+    except (TypeError, ValueError):
+        return "", 0
+
+    if host_port <= 0 or host_port > 65535:
+        return "", 0
+
+    if host_ip in {"localhost", "0.0.0.0", "::", "[::]", ""}:
+        host_ip = "127.0.0.1"
+
+    try:
+        ipaddress.ip_address(host_ip)
+    except ValueError:
+        if host_ip == "localhost":
+            host_ip = "127.0.0.1"
+
+    return host_ip, host_port
+
+
+def _authenticated_peer_id(headers):
+    """Resolve current user's stable peer id."""
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return ""
+    return get_peer_id_for_user(auth_user)
+
+
+def _register_authenticated_peer(headers):
+    """Upsert authenticated user's local endpoint into peer directory."""
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return ""
+
+    peer_id = get_peer_id_for_user(auth_user)
+    if not peer_id:
+        return ""
+
+    host_ip, host_port = _parse_host_ip_port(headers)
+    if host_ip and host_port:
+        add_peer_info(peer_id, host_ip, host_port, owner_username=auth_user)
+        register_tracker_peer(peer_id, host_ip, host_port)
+
+    return peer_id
 
 
 def _default_private_room_name(peers):
@@ -182,7 +266,7 @@ def handle_send_peer(headers, body):
 
     peer_id = data.get("to_peer")
     message = str(data.get("message", "")).strip()
-    sender = auth_user
+    sender_peer_id = _authenticated_peer_id(headers) or auth_user
 
     if not peer_id or not message:
         return _json(build_error("missing-fields", "Missing to_peer or message"))
@@ -195,22 +279,26 @@ def handle_send_peer(headers, body):
     if not room:
         return _json(build_error("invalid-room", "Unable to create direct room"))
 
+    recipient_user = str(info.get("owner_username", "") or "").strip() or str(
+        data.get("recipient_user", "shared") or "shared"
+    )
+
     envelope = build_envelope(
         COMMAND_SEND_PEER,
         payload={
             "message": message,
             "to_peer": str(peer_id),
-            "recipient_user": str(data.get("recipient_user", "shared") or "shared"),
+            "recipient_user": recipient_user,
             "room_name": room["room_name"],
         },
-        sender=str(sender),
+        sender=str(sender_peer_id),
     )
 
     stored = add_room_message(
         auth_user,
         room["room_id"],
         str(peer_id),
-        sender,
+        auth_user,
         message,
         "sent",
     )
@@ -263,7 +351,22 @@ def handle_receive_msg(headers, body):
         return _json(build_error("empty-message", "Message is empty"))
 
     payload = data.get("payload", {}) if isinstance(data, dict) else {}
-    peer_id = str(payload.get("to_peer", sender) or sender)
+    sender_peer_id = str(sender or "").strip() or "peer"
+    room_id = str(payload.get("room_id", "") or "").strip()
+    room_name = str(payload.get("room_name", "") or "").strip()
+
+    room_peers_raw = payload.get("peers", [])
+    room_peers = []
+    if isinstance(room_peers_raw, list):
+        seen_peers = set()
+        for peer in room_peers_raw:
+            safe_peer = str(peer or "").strip()
+            if not safe_peer or safe_peer in seen_peers:
+                continue
+            seen_peers.add(safe_peer)
+            room_peers.append(safe_peer)
+
+    use_shared_room = room_id.startswith("private::") and bool(room_peers)
 
     target_owners = set(get_direct_room_owners(sender))
     recipient_user = str(payload.get("recipient_user", "") or "").strip()
@@ -274,15 +377,31 @@ def handle_receive_msg(headers, body):
         target_owners.add("shared")
 
     for owner_username in target_owners:
-        room = get_or_create_direct_room(owner_username, sender)
+        if use_shared_room:
+            owner_peer_id = get_peer_id_for_user(owner_username)
+            normalized_peers = []
+            seen_peers = set()
+
+            # Build owner-local peer list: include sender, exclude owner itself.
+            for peer in room_peers + [sender_peer_id]:
+                safe_peer = str(peer or "").strip()
+                if not safe_peer or safe_peer == owner_peer_id or safe_peer in seen_peers:
+                    continue
+                seen_peers.add(safe_peer)
+                normalized_peers.append(safe_peer)
+
+            room = upsert_room_for_owner(owner_username, room_id, room_name, normalized_peers)
+        else:
+            room = get_or_create_direct_room(owner_username, sender_peer_id)
+
         if not room:
             continue
 
         add_room_message(
             owner_username,
             room["room_id"],
-            peer_id,
-            sender,
+            sender_peer_id,
+            sender_peer_id,
             message,
             "received",
         )
@@ -308,8 +427,9 @@ def handle_get_user_channels(headers, body):
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
+    peer_id = _register_authenticated_peer(headers)
     channels = get_user_channels(auth_user)
-    return _json({"status": "ok", "user": auth_user, "channels": channels})
+    return _json({"status": "ok", "user": auth_user, "peer_id": peer_id, "channels": channels})
 
 
 def handle_create_channel(headers, body):
@@ -517,19 +637,28 @@ def handle_get_online_peers(headers, body):
     if not auth_user:
         return _json(build_error("unauthorized", "Unauthorized"))
 
+    _register_authenticated_peer(headers)
+
     known_peers = {}
 
     for peer_id, info in get_tracker_peers().items():
-        known_peers[str(peer_id)] = {
-            "peer_id": str(peer_id),
+        safe_peer_id = str(peer_id)
+        known_user_id = get_username_for_peer_id(safe_peer_id)
+        known_peers[safe_peer_id] = {
+            "peer_id": safe_peer_id,
+            "user_id": known_user_id or safe_peer_id,
             "ip": str(info.get("ip", "")),
             "port": int(info.get("port", 0)) if info.get("port") is not None else 0,
             "source": "tracker",
         }
 
     for peer_id, info in get_all_peers().items():
-        known_peers[str(peer_id)] = {
-            "peer_id": str(peer_id),
+        safe_peer_id = str(peer_id)
+        owner_username = str(info.get("owner_username", "") or "").strip()
+        known_user_id = owner_username or get_username_for_peer_id(safe_peer_id)
+        known_peers[safe_peer_id] = {
+            "peer_id": safe_peer_id,
+            "user_id": known_user_id or safe_peer_id,
             "ip": str(info.get("ip", "")),
             "port": int(info.get("port", 0)) if info.get("port") is not None else 0,
             "source": "direct",
@@ -620,6 +749,7 @@ def handle_send_p2p_room_message(headers, body):
     auth_user = _authenticated_user(headers)
     if not auth_user:
         return _json(build_error("unauthorized", "Unauthorized"))
+    sender_peer_id = _authenticated_peer_id(headers) or auth_user
 
     data = _parse_json(body)
     if data is None:
@@ -627,7 +757,6 @@ def handle_send_p2p_room_message(headers, body):
 
     room_id = str(data.get("room_id", "")).strip()
     message = str(data.get("message", "")).strip()
-    recipient_user = str(data.get("recipient_user", "shared") or "shared")
 
     if not room_id:
         return _json(build_error("invalid-room", "room_id is required"))
@@ -637,6 +766,8 @@ def handle_send_p2p_room_message(headers, body):
     room = get_room(auth_user, room_id)
     if not room:
         return _json(build_error("room-not-found", "Room not found"))
+
+    shared_room_id = to_shared_private_room_id(room_id)
 
     peers = room.get("peers", [])
     if not peers:
@@ -658,9 +789,14 @@ def handle_send_p2p_room_message(headers, body):
         stored.append(item)
 
     for peer_id in peers:
+        if str(peer_id) == str(sender_peer_id):
+            continue
+
         peer_info = get_peer_info(peer_id)
         if not peer_info:
             continue
+
+        recipient_user = str(peer_info.get("owner_username", "") or "").strip() or "shared"
 
         envelope = build_envelope(
             COMMAND_SEND_PEER,
@@ -668,9 +804,11 @@ def handle_send_p2p_room_message(headers, body):
                 "message": message,
                 "to_peer": peer_id,
                 "recipient_user": recipient_user,
+                "room_id": shared_room_id,
                 "room_name": room.get("room_name", ""),
+                "peers": peers,
             },
-            sender=auth_user,
+            sender=sender_peer_id,
         )
 
         if _send_http_post(peer_info["ip"], peer_info["port"], envelope, endpoint="/receive-msg"):

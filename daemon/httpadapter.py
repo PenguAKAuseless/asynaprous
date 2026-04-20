@@ -157,7 +157,6 @@ class HttpAdapter:
             "/register.html",
             "/form.html",
             "/echo",
-            "/chat.html",
             "/receive-msg",
             "/api/receive-channel",
             "/favicon.ico",
@@ -174,6 +173,7 @@ class HttpAdapter:
             return False
 
         if path in {
+            "/chat.html",
             "/submit-info",
             "/add-list",
             "/get-list",
@@ -196,6 +196,20 @@ class HttpAdapter:
             "Connection: close\r\n"
             "\r\n"
         ).format(len(body)).encode("utf-8")
+        return response + body
+
+    def _build_redirect_response(self, location):
+        """Build a minimal 302 redirect response."""
+        target = str(location or "/login.html")
+        body = b""
+        response = (
+            "HTTP/1.1 302 Found\r\n"
+            "Location: {}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).format(target).encode("utf-8")
         return response + body
 
     def _connection_uses_tls(self):
@@ -336,7 +350,16 @@ class HttpAdapter:
         """Process login with body/auth credentials and set session cookie."""
         credentials = self._credentials_from_request(req)
         if not credentials or not check_credentials(credentials):
-            return self.response.build_unauthorized()
+            self.response.status_code = 401
+            self.response.reason = self.response._status_reason(401)
+            self.response.headers.pop("WWW-Authenticate", None)
+            self.response.headers["Cache-Control"] = "no-store"
+            return self.response.build_response(
+                req,
+                envelop_content=json.dumps(
+                    {"status": "error", "message": "Invalid username or password"}
+                ),
+            )
 
         username = credentials[0]
         session_id = create_session(username)
@@ -403,7 +426,10 @@ class HttpAdapter:
             if self._is_protected_path(req.path):
                 user = self._authenticate_request(req)
                 if not user:
-                    response = resp.build_unauthorized()
+                    if req.path == "/chat.html":
+                        response = self._build_redirect_response("/login.html")
+                    else:
+                        response = resp.build_unauthorized(include_challenge=False)
                     conn.sendall(response)
                     return
 
@@ -461,7 +487,10 @@ class HttpAdapter:
             if self._is_protected_path(req.path):
                 user = self._authenticate_request(req)
                 if not user:
-                    writer.write(resp.build_unauthorized())
+                    if req.path == "/chat.html":
+                        writer.write(self._build_redirect_response("/login.html"))
+                    else:
+                        writer.write(resp.build_unauthorized(include_challenge=False))
                     await writer.drain()
                     writer.close()
                     await writer.wait_closed()

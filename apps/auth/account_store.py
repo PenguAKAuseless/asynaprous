@@ -43,6 +43,8 @@ PBKDF2_HASH_NAME = "sha512"
 PBKDF2_ITERATIONS = 600_000
 PBKDF2_DKLEN = 64
 SALT_BYTES = 16
+PEER_ID_PREFIX = "peer_"
+PEER_ID_HEX_LEN = 24
 
 DEMO_ACCOUNTS = [
     {
@@ -121,6 +123,18 @@ def _hash_password(plain_password, salt_bytes, algorithm):
     raise ValueError("Unsupported hash algorithm: {}".format(algorithm))
 
 
+def generate_peer_id(username):
+    """Generate a deterministic peer id from username and optional salt."""
+    safe_username = str(username or "").strip().lower()
+    if not safe_username:
+        return ""
+
+    salt = os.environ.get("ASYNAPROUS_PEER_ID_SALT", "asynaprous-peer-id-v1")
+    material = "{}|{}".format(safe_username, salt).encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()
+    return "{}{}".format(PEER_ID_PREFIX, digest[:PEER_ID_HEX_LEN])
+
+
 def hash_password(plain_password):
     """Hash password using the strongest algorithm available in this runtime."""
     salt_bytes = os.urandom(SALT_BYTES)
@@ -176,6 +190,7 @@ def initialize_account_store():
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 username TEXT PRIMARY KEY,
+                peer_id TEXT UNIQUE,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 role TEXT NOT NULL,
@@ -186,6 +201,12 @@ def initialize_account_store():
             )
             """
         )
+
+        cur.execute("PRAGMA table_info(accounts)")
+        existing_columns = {row[1] for row in cur.fetchall()}
+        if "peer_id" not in existing_columns:
+            cur.execute("ALTER TABLE accounts ADD COLUMN peer_id TEXT")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_peer_id ON accounts(peer_id)")
 
         now = datetime.datetime.utcnow().isoformat() + "Z"
         for account in DEMO_ACCOUNTS:
@@ -200,11 +221,13 @@ def initialize_account_store():
             password = _resolve_demo_password(account)
 
             salt_hex, hash_hex, hash_algorithm = hash_password(password)
+            peer_id = generate_peer_id(username)
 
             cur.execute(
                 """
                 INSERT INTO accounts (
                     username,
+                    peer_id,
                     password_hash,
                     salt,
                     role,
@@ -212,10 +235,11 @@ def initialize_account_store():
                     created_at,
                     updated_at,
                     is_demo
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     username,
+                    peer_id,
                     hash_hex,
                     salt_hex,
                     role,
@@ -223,6 +247,18 @@ def initialize_account_store():
                     now,
                     now,
                 ),
+            )
+
+        cur.execute("SELECT username, peer_id FROM accounts")
+        for username, peer_id in cur.fetchall():
+            safe_username = str(username or "").strip()
+            safe_peer_id = str(peer_id or "").strip()
+            if not safe_username or safe_peer_id:
+                continue
+
+            cur.execute(
+                "UPDATE accounts SET peer_id = ?, updated_at = ? WHERE username = ?",
+                (generate_peer_id(safe_username), now, safe_username),
             )
 
         conn.commit()
@@ -240,7 +276,8 @@ def reset_account_store_runtime_state():
 
 def check_credentials_in_db(username, password):
     """Validate username/password against accounts table."""
-    if not username or password is None:
+    safe_username = _normalize_username(username)
+    if not safe_username or password is None:
         return False
 
     initialize_account_store()
@@ -250,7 +287,7 @@ def check_credentials_in_db(username, password):
         cur = conn.cursor()
         cur.execute(
             "SELECT password_hash, salt, hash_algorithm FROM accounts WHERE username = ?",
-            (str(username),),
+            (safe_username,),
         )
         row = cur.fetchone()
         conn.close()
@@ -298,9 +335,13 @@ def get_demo_account_rows():
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,32}$")
 
 
+def _normalize_username(username):
+    return str(username or "").strip().lower()
+
+
 def _validate_new_account_input(username, password):
     """Validate registration payload and return normalized values."""
-    safe_username = str(username or "").strip()
+    safe_username = _normalize_username(username)
     safe_password = str(password or "")
 
     if not safe_username:
@@ -334,6 +375,7 @@ def create_account(username, password, role="member", is_demo=False):
     safe_role = str(role or "member").strip() or "member"
     now = datetime.datetime.utcnow().isoformat() + "Z"
     salt_hex, hash_hex, hash_algorithm = hash_password(safe_password)
+    peer_id = generate_peer_id(safe_username)
 
     with _db_lock:
         conn = _connect()
@@ -347,6 +389,7 @@ def create_account(username, password, role="member", is_demo=False):
             """
             INSERT INTO accounts (
                 username,
+                peer_id,
                 password_hash,
                 salt,
                 role,
@@ -354,10 +397,11 @@ def create_account(username, password, role="member", is_demo=False):
                 created_at,
                 updated_at,
                 is_demo
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 safe_username,
+                peer_id,
                 hash_hex,
                 salt_hex,
                 safe_role,
@@ -371,3 +415,59 @@ def create_account(username, password, role="member", is_demo=False):
         conn.close()
 
     return True, "Account created"
+
+
+def get_peer_id_for_user(username):
+    """Return stable peer id for an account username."""
+    safe_username = _normalize_username(username)
+    if not safe_username:
+        return ""
+
+    initialize_account_store()
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT peer_id FROM accounts WHERE username = ?", (safe_username,))
+        row = cur.fetchone()
+
+        if row is None:
+            conn.close()
+            return ""
+
+        peer_id = str(row[0] or "").strip()
+        if peer_id:
+            conn.close()
+            return peer_id
+
+        generated = generate_peer_id(safe_username)
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        cur.execute(
+            "UPDATE accounts SET peer_id = ?, updated_at = ? WHERE username = ?",
+            (generated, now, safe_username),
+        )
+        conn.commit()
+        conn.close()
+
+    return generated
+
+
+def get_username_for_peer_id(peer_id):
+    """Resolve account username for a stored peer id."""
+    safe_peer_id = str(peer_id or "").strip()
+    if not safe_peer_id:
+        return ""
+
+    initialize_account_store()
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM accounts WHERE peer_id = ?", (safe_peer_id,))
+        row = cur.fetchone()
+        conn.close()
+
+    if not row:
+        return ""
+
+    return str(row[0] or "").strip()

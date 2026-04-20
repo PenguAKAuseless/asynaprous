@@ -2,7 +2,6 @@ const MODE_CHANNEL = "channel";
 const MODE_P2P = "p2p";
 
 const COMPOSER_NONE = "";
-const COMPOSER_CHANNEL = "channel";
 const COMPOSER_P2P = "p2p";
 
 let currentUser = "";
@@ -22,10 +21,16 @@ let knownPeers = [];
 
 let selectedPeerIds = [];
 let selectedPeerExpanded = false;
+let manualNoSelection = false;
 
 let latestViewToken = 0;
 let sendInFlight = false;
 let toastTimer = null;
+let modalResolver = null;
+
+function normalizeText(value) {
+    return String(value || "").trim();
+}
 
 function showToast(message, isError = false) {
     const toast = document.getElementById("toast");
@@ -72,16 +77,36 @@ async function apiJson(url, options = {}) {
     return payload;
 }
 
-function computeLocalPeerId(username) {
-    const host = window.location.hostname || "local";
-    const port = window.location.port || "default";
-    return `${username || "anonymous"}@${host}:${port}`;
+function peerLabelById(peerId) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId) {
+        return "";
+    }
+
+    const found = knownPeers.find((peer) => normalizeText(peer.peer_id) === safePeerId);
+    if (!found) {
+        return safePeerId;
+    }
+
+    return normalizeText(found.user_id) || safePeerId;
+}
+
+function peerDisplayLabelFromObject(peer) {
+    const peerId = normalizeText(peer.peer_id);
+    const userId = normalizeText(peer.user_id);
+
+    if (!peerId && !userId) {
+        return "unknown";
+    }
+
+    if (userId && peerId && userId !== peerId) {
+        return `${userId} (${peerId})`;
+    }
+
+    return userId || peerId;
 }
 
 function updateAccountStrip() {
-    document.getElementById("session-user").textContent = currentUser
-        ? `Signed in as ${currentUser}`
-        : "Signed in";
     document.getElementById("account-user").textContent = `User: ${currentUser || "-"}`;
     document.getElementById("account-peer-id").textContent = `Peer ID: ${localPeerId || "-"}`;
 }
@@ -89,26 +114,140 @@ function updateAccountStrip() {
 function closeAllRowMenus() {
     document.querySelectorAll(".row-menu.open").forEach((node) => {
         node.classList.remove("open");
+        node.style.left = "";
+        node.style.top = "";
     });
+}
+
+function openRowMenu(menu, triggerButton) {
+    const rect = triggerButton.getBoundingClientRect();
+    const menuWidth = 220;
+    const viewportPadding = 8;
+    let left = rect.right - menuWidth;
+    let top = rect.bottom + 6;
+
+    if (left < viewportPadding) {
+        left = viewportPadding;
+    }
+
+    if (top > window.innerHeight - 120) {
+        top = Math.max(viewportPadding, rect.top - 92);
+    }
+
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.classList.add("open");
+}
+
+function getModalNodes() {
+    return {
+        root: document.getElementById("action-modal"),
+        title: document.getElementById("action-modal-title"),
+        message: document.getElementById("action-modal-message"),
+        input: document.getElementById("action-modal-input"),
+        cancel: document.getElementById("action-modal-cancel"),
+        confirm: document.getElementById("action-modal-confirm")
+    };
+}
+
+function closeActionModal(result) {
+    const nodes = getModalNodes();
+    if (nodes.root) {
+        nodes.root.classList.remove("visible");
+    }
+
+    if (modalResolver) {
+        const resolver = modalResolver;
+        modalResolver = null;
+        resolver(result || { confirmed: false, value: "" });
+    }
+}
+
+function openActionModal(options = {}) {
+    const nodes = getModalNodes();
+    if (!nodes.root) {
+        return Promise.resolve({ confirmed: false, value: "" });
+    }
+
+    if (modalResolver) {
+        closeActionModal({ confirmed: false, value: "" });
+    }
+
+    const title = normalizeText(options.title) || "Confirm Action";
+    const message = normalizeText(options.message);
+    const confirmLabel = normalizeText(options.confirmLabel) || "Confirm";
+    const cancelLabel = normalizeText(options.cancelLabel) || "Cancel";
+    const inputVisible = Boolean(options.inputVisible);
+    const inputValue = normalizeText(options.inputValue);
+    const inputPlaceholder = normalizeText(options.inputPlaceholder);
+    const danger = Boolean(options.danger);
+
+    nodes.title.textContent = title;
+    nodes.message.textContent = message;
+    nodes.cancel.textContent = cancelLabel;
+    nodes.confirm.textContent = confirmLabel;
+    nodes.confirm.classList.toggle("danger", danger);
+
+    if (inputVisible) {
+        nodes.input.value = inputValue;
+        nodes.input.placeholder = inputPlaceholder;
+        nodes.input.classList.remove("hidden");
+    } else {
+        nodes.input.value = "";
+        nodes.input.classList.add("hidden");
+    }
+
+    nodes.root.classList.add("visible");
+    if (inputVisible) {
+        nodes.input.focus();
+        nodes.input.select();
+    } else {
+        nodes.confirm.focus();
+    }
+
+    return new Promise((resolve) => {
+        modalResolver = resolve;
+    });
+}
+
+async function promptRename(kindLabel, currentName) {
+    const outcome = await openActionModal({
+        title: `Rename ${kindLabel}`,
+        message: `Update the ${kindLabel} name.`,
+        confirmLabel: "Save",
+        cancelLabel: "Cancel",
+        inputVisible: true,
+        inputValue: currentName,
+        inputPlaceholder: `New ${kindLabel} name`
+    });
+
+    if (!outcome.confirmed) {
+        return "";
+    }
+
+    return normalizeText(outcome.value);
+}
+
+async function confirmLeave(kindLabel, name) {
+    const outcome = await openActionModal({
+        title: `Leave ${kindLabel}`,
+        message: `Leave '${name}'? This removes it from your list.`,
+        confirmLabel: "Leave",
+        cancelLabel: "Cancel",
+        danger: true
+    });
+
+    return Boolean(outcome.confirmed);
 }
 
 function setComposerMode(mode) {
     composerMode = mode;
 
     const shell = document.getElementById("workspace-tools");
-    const channelComposer = document.getElementById("channel-composer");
     const p2pComposer = document.getElementById("p2p-composer");
 
     shell.classList.remove("visible");
-    channelComposer.classList.remove("visible");
     p2pComposer.classList.remove("visible");
-
-    if (mode === COMPOSER_CHANNEL) {
-        shell.classList.add("visible");
-        channelComposer.classList.add("visible");
-        document.getElementById("channel-input").focus();
-        return;
-    }
 
     if (mode === COMPOSER_P2P) {
         shell.classList.add("visible");
@@ -118,7 +257,31 @@ function setComposerMode(mode) {
     }
 }
 
+function updateChatInputState() {
+    const inputArea = document.getElementById("input-area");
+    const input = document.getElementById("msg-input");
+    const sendButton = document.getElementById("send-btn");
+    const closeButton = document.getElementById("close-conversation-btn");
+    const hasSelection = Boolean(currentTarget.mode && currentTarget.id);
+
+    input.disabled = !hasSelection;
+    sendButton.disabled = !hasSelection;
+    inputArea.classList.toggle("disabled", !hasSelection);
+    closeButton.classList.toggle("hidden", !hasSelection);
+
+    if (hasSelection) {
+        input.placeholder = "Type a message and press Enter";
+        return;
+    }
+
+    input.placeholder = "Select a conversation to start chatting";
+}
+
 function setTarget(mode, id, title, subtitle) {
+    if (mode && id) {
+        manualNoSelection = false;
+    }
+
     currentTarget = {
         mode,
         id,
@@ -134,6 +297,12 @@ function setTarget(mode, id, title, subtitle) {
     renderMessages([]);
     renderChannelList();
     renderP2PRoomList();
+    updateChatInputState();
+}
+
+function clearConversationSelection() {
+    manualNoSelection = true;
+    setTarget("", "", "No room selected", "Choose a channel or conversation from the left panel.");
 }
 
 function renderMessages(messages) {
@@ -192,6 +361,9 @@ function buildSidebarItem(config) {
 
     const menu = document.createElement("div");
     menu.className = "row-menu";
+    menu.addEventListener("click", (event) => {
+        event.stopPropagation();
+    });
 
     const renameBtn = document.createElement("button");
     renameBtn.type = "button";
@@ -220,7 +392,7 @@ function buildSidebarItem(config) {
         const willOpen = !menu.classList.contains("open");
         closeAllRowMenus();
         if (willOpen) {
-            menu.classList.add("open");
+            openRowMenu(menu, menuButton);
         }
     });
 
@@ -236,6 +408,7 @@ function renderChannelList() {
 
     if (knownChannels.length === 0) {
         const empty = document.createElement("li");
+        empty.className = "empty-state";
         empty.textContent = "No channels yet";
         list.appendChild(empty);
         return;
@@ -251,11 +424,7 @@ function renderChannelList() {
                 await refreshCurrentMessages();
             },
             onRename: async () => {
-                const newName = window.prompt("Rename channel", channel);
-                if (newName === null) {
-                    return;
-                }
-                const safeName = String(newName).trim();
+                const safeName = await promptRename("channel", channel);
                 if (!safeName || safeName === channel) {
                     return;
                 }
@@ -274,7 +443,7 @@ function renderChannelList() {
                 }
             },
             onLeave: async () => {
-                if (!window.confirm(`Leave channel '${channel}'?`)) {
+                if (!(await confirmLeave("channel", channel))) {
                     return;
                 }
 
@@ -302,13 +471,14 @@ function renderP2PRoomList() {
 
     if (knownP2PRooms.length === 0) {
         const empty = document.createElement("li");
+        empty.className = "empty-state";
         empty.textContent = "No conversations yet";
         list.appendChild(empty);
         return;
     }
 
     knownP2PRooms.forEach((room) => {
-        const peerText = Array.isArray(room.peers) ? room.peers.join(", ") : "";
+        const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
         const item = buildSidebarItem({
             label: room.room_name,
             kind: "conversation",
@@ -323,11 +493,7 @@ function renderP2PRoomList() {
                 await refreshCurrentMessages();
             },
             onRename: async () => {
-                const newName = window.prompt("Rename conversation", room.room_name);
-                if (newName === null) {
-                    return;
-                }
-                const safeName = String(newName).trim();
+                const safeName = await promptRename("conversation", room.room_name);
                 if (!safeName || safeName === room.room_name) {
                     return;
                 }
@@ -351,7 +517,7 @@ function renderP2PRoomList() {
                 }
             },
             onLeave: async () => {
-                if (!window.confirm(`Leave conversation '${room.room_name}'?`)) {
+                if (!(await confirmLeave("conversation", room.room_name))) {
                     return;
                 }
 
@@ -382,17 +548,17 @@ function renderPeerSearchResults() {
         return;
     }
 
-    const query = String(document.getElementById("peer-search-input").value || "")
-        .trim()
-        .toLowerCase();
+    const query = normalizeText(document.getElementById("peer-search-input").value).toLowerCase();
     if (!query) {
         list.classList.remove("visible");
         return;
     }
 
     const matches = knownPeers.filter((peer) => {
-        const id = String(peer.peer_id || "").toLowerCase();
-        return id.includes(query) && !selectedPeerIds.includes(String(peer.peer_id));
+        const peerId = normalizeText(peer.peer_id);
+        const userId = normalizeText(peer.user_id);
+        const matchesQuery = peerId.toLowerCase().includes(query) || userId.toLowerCase().includes(query);
+        return matchesQuery && peerId !== localPeerId && !selectedPeerIds.includes(peerId);
     });
 
     if (matches.length === 0) {
@@ -405,9 +571,10 @@ function renderPeerSearchResults() {
 
     matches.forEach((peer) => {
         const li = document.createElement("li");
-        li.textContent = `${peer.peer_id} (${peer.ip}:${peer.port})`;
+        const endpoint = `(${normalizeText(peer.ip)}:${String(peer.port || 0)})`;
+        li.textContent = `${peerDisplayLabelFromObject(peer)} ${endpoint}`;
         li.addEventListener("click", () => {
-            addSelectedPeer(String(peer.peer_id));
+            addSelectedPeer(normalizeText(peer.peer_id));
         });
         list.appendChild(li);
     });
@@ -426,7 +593,7 @@ function removeSelectedPeer(peerId) {
 function makePeerChip(peerId) {
     const chip = document.createElement("span");
     chip.className = "peer-chip";
-    chip.appendChild(document.createTextNode(peerId));
+    chip.appendChild(document.createTextNode(peerLabelById(peerId) || peerId));
 
     const removeBtn = document.createElement("button");
     removeBtn.type = "button";
@@ -476,11 +643,8 @@ function renderSelectedPeerSelection() {
 }
 
 function addSelectedPeer(peerId) {
-    const safe = String(peerId || "").trim();
-    if (!safe) {
-        return;
-    }
-    if (selectedPeerIds.includes(safe)) {
+    const safe = normalizeText(peerId);
+    if (!safe || selectedPeerIds.includes(safe)) {
         return;
     }
 
@@ -495,10 +659,13 @@ function buildPrivateRoomName(peers) {
     if (!Array.isArray(peers) || peers.length === 0) {
         return "Private Conversation";
     }
-    if (peers.length <= 2) {
-        return `P2P: ${peers.join(", ")}`;
+
+    const labels = peers.map((peerId) => peerLabelById(peerId) || peerId);
+    if (labels.length <= 2) {
+        return `P2P: ${labels.join(", ")}`;
     }
-    return `P2P: ${peers[0]}, ${peers[1]} +${peers.length - 2}`;
+
+    return `P2P: ${labels[0]}, ${labels[1]} +${labels.length - 2}`;
 }
 
 async function loadChannels() {
@@ -508,8 +675,8 @@ async function loadChannels() {
         body: "{}"
     });
 
-    currentUser = String(data.user || "").trim();
-    localPeerId = computeLocalPeerId(currentUser);
+    currentUser = normalizeText(data.user);
+    localPeerId = normalizeText(data.peer_id);
     updateAccountStrip();
 
     knownChannels = Array.isArray(data.channels) ? data.channels : [];
@@ -528,7 +695,9 @@ async function loadP2PRooms() {
 
 async function loadPeerCatalog() {
     const data = await apiJson("/api/online-peers", { method: "GET" });
-    knownPeers = Array.isArray(data.peers) ? data.peers : [];
+    knownPeers = (Array.isArray(data.peers) ? data.peers : []).filter((peer) => {
+        return normalizeText(peer.peer_id) !== localPeerId;
+    });
     renderPeerSearchResults();
 }
 
@@ -547,6 +716,10 @@ function ensureActiveTarget() {
     }
 
     if (!currentTarget.mode) {
+        if (manualNoSelection) {
+            return;
+        }
+
         if (knownChannels.length > 0) {
             setTarget(MODE_CHANNEL, knownChannels[0], `# ${knownChannels[0]}`, "Public channel conversation");
             return;
@@ -554,7 +727,7 @@ function ensureActiveTarget() {
 
         if (knownP2PRooms.length > 0) {
             const room = knownP2PRooms[0];
-            const peerText = Array.isArray(room.peers) ? room.peers.join(", ") : "";
+            const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
             setTarget(
                 MODE_P2P,
                 room.room_id,
@@ -620,7 +793,7 @@ async function sendMessage() {
     }
 
     const input = document.getElementById("msg-input");
-    const message = String(input.value || "").trim();
+    const message = normalizeText(input.value);
     if (!message) {
         return;
     }
@@ -651,10 +824,9 @@ async function sendMessage() {
     }
 }
 
-async function upsertChannelFromComposer() {
-    const channelInput = document.getElementById("channel-input");
-    const channel = String(channelInput.value || "").trim();
-    if (!channel) {
+async function upsertChannel(channel) {
+    const safeChannel = normalizeText(channel);
+    if (!safeChannel) {
         showToast("Channel name is required", true);
         return;
     }
@@ -662,13 +834,32 @@ async function upsertChannelFromComposer() {
     await apiJson("/api/channel-upsert", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel })
+        body: JSON.stringify({ channel: safeChannel })
     });
 
-    channelInput.value = "";
     await refreshSidebarData();
-    setTarget(MODE_CHANNEL, channel, `# ${channel}`, "Public channel conversation");
+    setTarget(MODE_CHANNEL, safeChannel, `# ${safeChannel}`, "Public channel conversation");
     await refreshCurrentMessages();
+}
+
+async function openChannelCreateFlow() {
+    clearConversationSelection();
+    setComposerMode(COMPOSER_NONE);
+
+    const outcome = await openActionModal({
+        title: "Add or Join Channel",
+        message: "Enter the channel name you want to join or create.",
+        confirmLabel: "Continue",
+        cancelLabel: "Cancel",
+        inputVisible: true,
+        inputPlaceholder: "Channel name"
+    });
+
+    if (!outcome.confirmed) {
+        return;
+    }
+
+    await upsertChannel(outcome.value);
 }
 
 async function createP2PRoomFromComposer() {
@@ -695,8 +886,13 @@ async function createP2PRoomFromComposer() {
 
     await loadP2PRooms();
     const room = payload.room;
-    const peerText = Array.isArray(room.peers) ? room.peers.join(", ") : "";
-    setTarget(MODE_P2P, room.room_id, room.room_name, peerText ? `Peers: ${peerText}` : "Private conversation");
+    const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
+    setTarget(
+        MODE_P2P,
+        room.room_id,
+        room.room_name,
+        peerText ? `Peers: ${peerText}` : "Private conversation"
+    );
     await refreshCurrentMessages();
 }
 
@@ -715,6 +911,8 @@ function bindUi() {
     document.addEventListener("click", () => {
         closeAllRowMenus();
     });
+    window.addEventListener("resize", closeAllRowMenus);
+    window.addEventListener("scroll", closeAllRowMenus, true);
 
     document.getElementById("send-btn").addEventListener("click", () => {
         sendMessage().catch((error) => {
@@ -736,11 +934,9 @@ function bindUi() {
     });
 
     document.getElementById("new-channel-btn").addEventListener("click", () => {
-        if (composerMode === COMPOSER_CHANNEL) {
-            setComposerMode(COMPOSER_NONE);
-            return;
-        }
-        setComposerMode(COMPOSER_CHANNEL);
+        openChannelCreateFlow().catch((error) => {
+            showToast(error.message || "Unable to join/create channel", true);
+        });
     });
 
     document.getElementById("new-p2p-btn").addEventListener("click", () => {
@@ -749,12 +945,6 @@ function bindUi() {
             return;
         }
         setComposerMode(COMPOSER_P2P);
-    });
-
-    document.getElementById("channel-upsert-btn").addEventListener("click", () => {
-        upsertChannelFromComposer().catch((error) => {
-            showToast(error.message || "Unable to join/create channel", true);
-        });
     });
 
     document.getElementById("peer-search-input").addEventListener("input", () => {
@@ -773,11 +963,49 @@ function bindUi() {
     });
 
     document.getElementById("logout-btn").addEventListener("click", logout);
+    document.getElementById("close-conversation-btn").addEventListener("click", () => {
+        closeAllRowMenus();
+        clearConversationSelection();
+    });
+
+    const modal = document.getElementById("action-modal");
+    const modalInput = document.getElementById("action-modal-input");
+    const modalCancel = document.getElementById("action-modal-cancel");
+    const modalConfirm = document.getElementById("action-modal-confirm");
+
+    modal.addEventListener("click", (event) => {
+        if (event.target === modal) {
+            closeActionModal({ confirmed: false, value: "" });
+        }
+    });
+
+    modalCancel.addEventListener("click", () => {
+        closeActionModal({ confirmed: false, value: "" });
+    });
+
+    modalConfirm.addEventListener("click", () => {
+        closeActionModal({ confirmed: true, value: modalInput.value });
+    });
+
+    modalInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            closeActionModal({ confirmed: true, value: modalInput.value });
+        }
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && modal.classList.contains("visible")) {
+            event.preventDefault();
+            closeActionModal({ confirmed: false, value: "" });
+        }
+    });
 }
 
 async function initialize() {
     bindUi();
     renderSelectedPeerSelection();
+    updateChatInputState();
 
     try {
         await refreshSidebarData();
@@ -793,6 +1021,13 @@ async function initialize() {
     }, 2000);
 
     window.setInterval(() => {
+        if (document.querySelector(".row-menu.open")) {
+            return;
+        }
+        if (document.getElementById("action-modal")?.classList.contains("visible")) {
+            return;
+        }
+
         refreshSidebarData().catch((error) => {
             console.error("sidebar refresh failed", error);
         });

@@ -275,11 +275,13 @@ class Response:
         self._header = self.build_response_header(request)
         return self._header + self._content
 
-    def build_unauthorized(self, realm="AsynapRous"):
-        """Build a standard 401 response with HTTP auth challenge."""
+    def build_unauthorized(self, realm="AsynapRous", include_challenge=True):
+        """Build a 401 response with optional HTTP auth challenge header."""
         self.status_code = 401
         self.reason = self._status_reason(401)
-        self.headers["WWW-Authenticate"] = 'Basic realm="{}"'.format(realm)
+        self.headers.pop("WWW-Authenticate", None)
+        if include_challenge:
+            self.headers["WWW-Authenticate"] = 'Basic realm="{}"'.format(realm)
         self.headers["Content-Type"] = "text/html; charset=utf-8"
         self._content = b"<h1>401 Unauthorized</h1>"
         return self.build_response_header(None) + self._content
