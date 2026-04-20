@@ -27,8 +27,11 @@ from .tracker.handlers import handle_add_list, handle_get_list, handle_submit_in
 from .chat.handlers import (
     handle_broadcast_peer,
     handle_connect_peer,
+    handle_create_channel,
     handle_get_channel_msgs,
     handle_get_channels,
+    handle_get_user_channels,
+    handle_join_channel,
     handle_receive_channel_msg,
     handle_receive_msg,
     handle_send_channel_msg,
@@ -135,6 +138,21 @@ def receive_msg(headers, body):
 @app.route("/api/channels", methods=["GET"])
 def api_channels(headers, body):
     return handle_get_channels(headers, body)
+
+
+@app.route("/api/my-channels", methods=["POST"])
+def api_my_channels(headers, body):
+    return handle_get_user_channels(headers, body)
+
+
+@app.route("/api/create-channel", methods=["POST"])
+def api_create_channel(headers, body):
+    return handle_create_channel(headers, body)
+
+
+@app.route("/api/join-channel", methods=["POST"])
+def api_join_channel(headers, body):
+    return handle_join_channel(headers, body)
 
 @app.route("/api/get-messages", methods=["POST"])
 def api_get_messages(headers, body):

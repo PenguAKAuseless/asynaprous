@@ -1,26 +1,41 @@
 let currentChannel = "general";
 let localMessageCount = 0;
+const currentUser = localStorage.getItem("chatUser") || "me";
+
+async function apiJson(url, options = {}) {
+    const response = await fetch(url, options);
+
+    if (response.status === 401) {
+        window.location.href = "/login.html";
+        throw new Error("Unauthorized");
+    }
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Request failed: ${response.status}`);
+    }
+
+    return response.json();
+}
 
 async function loadChannels() {
     try {
-        const res = await fetch("/api/channels");
-        if (res.status === 401) {
-            window.location.href = "/login.html";
-            return;
-        }
-        if (!res.ok) {
-            throw new Error("Unable to load channels");
-        }
+        const payload = { user: currentUser };
+        const data = await apiJson("/api/my-channels", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
 
-        const channels = await res.json();
+        const channels = data.channels || [];
         const list = document.getElementById("channel-list");
         list.replaceChildren();
 
-        channels.forEach(c => {
-        let li = document.createElement("li");
-        li.textContent = "# " + c;
-        li.onclick = () => selectChannel(c);
-        list.appendChild(li);
+        channels.forEach((channel) => {
+            const li = document.createElement("li");
+            li.textContent = "# " + channel;
+            li.onclick = () => selectChannel(channel);
+            list.appendChild(li);
         });
 
         if (channels.length > 0) {
@@ -30,52 +45,23 @@ async function loadChannels() {
         console.error("loadChannels failed", error);
     }
 }
-/*----example
-    channels is an array like ["general", "networking"].
-    loops - forEach() - first loop: c = "general" 
-    createElement("li") - creates a new <li> element - thẻ HTML empty - save in variable li
-    # + c - context inside <li> is # general --> <li># general</li>
-    onClick - when user click on <li>, do selectChannel("general") - wait until user click (meaning of () => )
-    append <li> to <ul>
-*/ 
 
 function selectChannel(channel) {
-    // No need - just update value, change content, reset counter, poll messages
     currentChannel = channel;
     document.getElementById("current-channel").textContent = "# " + channel;
-    localMessageCount = 0; // Reset counter for the new channel
+    localMessageCount = 0;
     pollMessages();
 }
-/*
-    switch the value of currentChannel to the new channel --> sync
-    reset counter because of new channel
-    polling messages for the new channel - fetch messages from BE and render to UI
-
-*/
 
 async function pollMessages() {
     try {
-        const res = await fetch("/api/get-messages", {
+        const messages = await apiJson("/api/get-messages", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ channel: currentChannel })
         });
 
-        if (res.status === 401) {
-            window.location.href = "/login.html";
-            return;
-        }
-
-        if (!res.ok) {
-            throw new Error("Unable to poll messages");
-        }
-
-        const messages = await res.json();
-
-        if (messages.length > localMessageCount) {
-            if (localMessageCount !== 0) {
-                console.log("New message notification triggered!");
-            }
+        if (messages.length >= localMessageCount) {
             localMessageCount = messages.length;
             renderMessages(messages);
         }
@@ -83,68 +69,52 @@ async function pollMessages() {
         console.error("pollMessages failed", error);
     }
 }
-/*
-    fetch messages send to endpoint /api/get-messages
-    BE send back an array of messages for the current channel
-    if length > local, have new messages - update local count and render to UI
-    but !==0 : just noti new message - avoid old noti when load channel
-    update local count
-    render messages to UI - update the message list in the UI
-
-*/
 
 function renderMessages(messages) {
     const container = document.getElementById("messages");
     container.replaceChildren();
-    messages.forEach(m => {
-        let div = document.createElement("div");
+
+    messages.forEach((message) => {
+        const div = document.createElement("div");
         div.className = "msg";
 
-        let timeSpan = document.createElement("span");
+        const timeSpan = document.createElement("span");
         timeSpan.className = "msg-time";
-        timeSpan.textContent = `[${m.timestamp}]`;
+        timeSpan.textContent = `[${message.timestamp}]`;
 
-        let senderSpan = document.createElement("span");
+        const senderSpan = document.createElement("span");
         senderSpan.className = "msg-sender";
-        senderSpan.textContent = `${m.sender}:`;
+        senderSpan.textContent = `${message.sender}:`;
 
         div.appendChild(timeSpan);
         div.appendChild(document.createTextNode(" "));
         div.appendChild(senderSpan);
         div.appendChild(document.createTextNode(" "));
-        div.appendChild(document.createTextNode(m.message));
+        div.appendChild(document.createTextNode(message.message));
 
         container.appendChild(div);
     });
+
     container.scrollTop = container.scrollHeight;
 }
-/*
-    find id of message which is ready to show
-    remove all old message container - replaceChildren() 
-    loop: create timestamp span, sender span, append to message div, append message div to container
-    scroll to bottom - always show the latest message
-*/
 
 async function sendMessage() {
     const input = document.getElementById("msg-input");
-    const msg = input.value.trim();
-    if (!msg) return;
+    const message = input.value.trim();
+    if (!message) {
+        return;
+    }
 
     try {
-        const res = await fetch("/api/send-channel", {
+        await apiJson("/api/send-channel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ channel: currentChannel, message: msg, sender: "me" })
+            body: JSON.stringify({
+                channel: currentChannel,
+                message,
+                sender: currentUser
+            })
         });
-
-        if (res.status === 401) {
-            window.location.href = "/login.html";
-            return;
-        }
-
-        if (!res.ok) {
-            throw new Error("Unable to send message");
-        }
 
         input.value = "";
         pollMessages();
@@ -152,14 +122,51 @@ async function sendMessage() {
         console.error("sendMessage failed", error);
     }
 }
-/*
-    find textbox element, get message, trim whitespace, if empty return
-    wait until fetch to send message to BE (endpoint /api/send-channel)
-    reset input box
-    immediately poll messages to update UI with the new message
 
-*/
-// Short polling every 2 seconds to check BE new messages - Notification system
+async function createChannel() {
+    const input = document.getElementById("channel-input");
+    const channel = input.value.trim();
+    if (!channel) {
+        return;
+    }
+
+    try {
+        await apiJson("/api/create-channel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ channel, user: currentUser })
+        });
+
+        input.value = "";
+        await loadChannels();
+        selectChannel(channel);
+    } catch (error) {
+        console.error("createChannel failed", error);
+    }
+}
+
+async function joinChannel() {
+    const input = document.getElementById("channel-input");
+    const channel = input.value.trim();
+    if (!channel) {
+        return;
+    }
+
+    try {
+        await apiJson("/api/join-channel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ channel, user: currentUser })
+        });
+
+        input.value = "";
+        await loadChannels();
+        selectChannel(channel);
+    } catch (error) {
+        console.error("joinChannel failed", error);
+    }
+}
+
 window.onload = () => {
     loadChannels();
     setInterval(pollMessages, 2000);

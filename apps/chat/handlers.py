@@ -4,7 +4,14 @@ import json
 import socket
 import threading
 
-from .channel_service import add_message, get_channels, get_messages
+from .channel_service import (
+    add_message,
+    create_channel,
+    get_channels,
+    get_messages,
+    get_user_channels,
+    join_channel,
+)
 from .peer_service import add_peer_info, get_all_peers, get_peer_info
 from .protocol import (
     COMMAND_BROADCAST_PEER,
@@ -176,6 +183,58 @@ def handle_get_channels(headers, body):
     _ = headers
     _ = body
     return _json(get_channels())
+
+
+def handle_get_user_channels(headers, body):
+    """Handle POST /api/my-channels."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    user = str(data.get("user", "")).strip()
+    channels = get_user_channels(user)
+    return _json({"status": "ok", "channels": channels})
+
+
+def handle_create_channel(headers, body):
+    """Handle POST /api/create-channel."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    channel = str(data.get("channel", "")).strip()
+    user = str(data.get("user", "me")).strip()
+
+    created, info = create_channel(channel, user)
+    if info == "invalid-channel":
+        return _json(build_error("invalid-channel", "Channel name is required"))
+
+    return _json({
+        "status": "created" if created else "exists",
+        "channel": info,
+        "user": user,
+    })
+
+
+def handle_join_channel(headers, body):
+    """Handle POST /api/join-channel."""
+    _ = headers
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    channel = str(data.get("channel", "")).strip()
+    user = str(data.get("user", "me")).strip()
+
+    ok, info = join_channel(channel, user)
+    if not ok:
+        if info == "channel-not-found":
+            return _json(build_error("channel-not-found", "Channel does not exist"))
+        return _json(build_error("invalid-channel", "Channel name is required"))
+
+    return _json({"status": "joined", "channel": info, "user": user})
 
 
 def handle_get_channel_msgs(headers, body):

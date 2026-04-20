@@ -22,8 +22,13 @@ using the socket framework. It parses command-line arguments to configure the
 server's IP address and port, and then launches the backend server.
 """
 
-import socket
 import argparse
+import ipaddress
+
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 from daemon import create_backend
 
@@ -59,9 +64,42 @@ if __name__ == "__main__":
         default=PORT,
         help="Port number to bind the server. Default is {}.".format(PORT),
     )
+    parser.add_argument(
+        "--purge-db-demo",
+        action="store_true",
+        help="Purge database tables and reseed demo users/channels, then exit.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm destructive admin command such as --purge-db-demo.",
+    )
 
     args = parser.parse_args()
+
+    if args.purge_db_demo:
+        if not args.yes:
+            raise SystemExit("Refusing to purge database without --yes")
+
+        from apps.db_admin import purge_database_to_demo
+
+        summary = purge_database_to_demo()
+        print("[start_backend] Purged demo database: {}".format(summary["db_path"]))
+        print("[start_backend] Seeded accounts: {}".format(", ".join(summary["demo_accounts"])))
+        print("[start_backend] Seeded channels: {}".format(", ".join(summary["channels"])))
+        raise SystemExit(0)
+
     ip = args.server_ip
     port = args.server_port
+
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise SystemExit("Invalid --server-ip: {}".format(ip))
+
+    if port <= 0 or port > 65535:
+        raise SystemExit("Invalid --server-port: {}".format(port))
+
+    print("[start_backend] Launching backend on {}:{}".format(ip, port))
 
     create_backend(ip, port)

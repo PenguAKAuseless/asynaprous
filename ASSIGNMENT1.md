@@ -352,7 +352,7 @@ When a communication is halted, there are multiple processing flows to be handle
 - Multi-thread create a thread to handle the new created processing flows.
 - Event-driven relies on registering callbacks that are executed when an operation completes. Instead
     of waiting for I/O, the program continues running, and the event loop triggers the callback once the
-    communication is completed nad the data is ready. While powerful, it can lead to complex nested code
+    communication is completed and the data is ready. While powerful, it can lead to complex nested code
     structures, often referred to as “callback hell.”
        - Some recently updated event mechansims (i.e futures or promises) allow chaining events by putting
           a placeholder for object representing a result that will be available later.

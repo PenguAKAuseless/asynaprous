@@ -110,6 +110,7 @@
           return;
         }
 
+        localStorage.setItem("chatUser", username || "me");
         window.location.href = "/chat.html";
       } catch (err) {
         errorNode.textContent = "Network error. Please retry.";

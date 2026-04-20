@@ -24,9 +24,13 @@ HTTP requests. The application includes a login endpoint and a greeting endpoint
 and can be configured via command-line arguments.
 """
 
-import json
-import socket
 import argparse
+import ipaddress
+
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 from apps import create_sampleapp
 
@@ -43,6 +47,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     ip = args.server_ip
     port = args.server_port
+
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise SystemExit("Invalid --server-ip: {}".format(ip))
+
+    if port <= 0 or port > 65535:
+        raise SystemExit("Invalid --server-port: {}".format(port))
+
+    print("[start_sampleapp] Launching sampleapp on {}:{}".format(ip, port))
 
     # Prepare and launch the RESTful application
     create_sampleapp(ip, port)

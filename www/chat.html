@@ -24,6 +24,11 @@
 <body>
     <div id="sidebar">
         <h3>Channels</h3>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">
+            <input type="text" id="channel-input" placeholder="channel name" style="padding:8px; border:1px solid #34495e; border-radius:4px;">
+            <button onclick="createChannel()" style="margin-left:0;">Create</button>
+            <button onclick="joinChannel()" style="margin-left:0; background:#1f7a8c;">Join</button>
+        </div>
         <ul id="channel-list"></ul>
     </div>
     <div id="chat-area">

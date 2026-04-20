@@ -39,8 +39,14 @@ import socket
 import threading
 import argparse
 import re
+import ipaddress
 from urllib.parse import urlparse
 from collections import defaultdict
+
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 from daemon import create_proxy
 
@@ -125,6 +131,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     ip = args.server_ip
     port = args.server_port
+
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise SystemExit("Invalid --server-ip: {}".format(ip))
+
+    if port <= 0 or port > 65535:
+        raise SystemExit("Invalid --server-port: {}".format(port))
+
+    print("[start_proxy] Launching proxy on {}:{}".format(ip, port))
 
     routes = parse_virtual_hosts("config/proxy.conf")
 
