@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import hmac
 import os
+import re
 import sqlite3
 import threading
 
@@ -292,3 +293,81 @@ def get_demo_account_rows():
             }
         )
     return result
+
+
+_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+
+
+def _validate_new_account_input(username, password):
+    """Validate registration payload and return normalized values."""
+    safe_username = str(username or "").strip()
+    safe_password = str(password or "")
+
+    if not safe_username:
+        return False, "Username is required", "", ""
+
+    if not _USERNAME_PATTERN.match(safe_username):
+        return (
+            False,
+            "Username must be 3-32 chars and use only letters, digits, underscore",
+            "",
+            "",
+        )
+
+    if len(safe_password) < 8:
+        return False, "Password must be at least 8 characters", "", ""
+
+    return True, "", safe_username, safe_password
+
+
+def create_account(username, password, role="member", is_demo=False):
+    """Create a non-demo account and return (created, message)."""
+    initialize_account_store()
+
+    ok, error_message, safe_username, safe_password = _validate_new_account_input(
+        username,
+        password,
+    )
+    if not ok:
+        return False, error_message
+
+    safe_role = str(role or "member").strip() or "member"
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    salt_hex, hash_hex, hash_algorithm = hash_password(safe_password)
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM accounts WHERE username = ?", (safe_username,))
+        if cur.fetchone() is not None:
+            conn.close()
+            return False, "Username already exists"
+
+        cur.execute(
+            """
+            INSERT INTO accounts (
+                username,
+                password_hash,
+                salt,
+                role,
+                hash_algorithm,
+                created_at,
+                updated_at,
+                is_demo
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                safe_username,
+                hash_hex,
+                salt_hex,
+                safe_role,
+                hash_algorithm,
+                now,
+                now,
+                1 if is_demo else 0,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    return True, "Account created"

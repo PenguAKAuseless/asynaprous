@@ -31,8 +31,6 @@ def get_db_path():
 
 DB_PATH = get_db_path()
 
-DEFAULT_CHANNELS = ["general", "networking", "random"]
-
 _db_lock = threading.Lock()
 _initialized = False
 
@@ -94,16 +92,6 @@ def initialize_message_store():
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_name, id)"
         )
-
-        now = datetime.datetime.utcnow().isoformat() + "Z"
-        for channel_name in DEFAULT_CHANNELS:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO channels (name, created_by, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (channel_name, "system", now),
-            )
 
         conn.commit()
         conn.close()
@@ -189,6 +177,107 @@ def join_channel(channel_name, user="me"):
         conn.close()
 
     return True, safe_channel
+
+
+def rename_channel(channel_name, new_channel_name, user=""):
+    """Rename one channel when requesting user is a member."""
+    initialize_message_store()
+
+    old_name = str(channel_name or "").strip()
+    new_name = str(new_channel_name or "").strip()
+    safe_user = str(user or "").strip()
+
+    if not old_name or not new_name:
+        return False, "invalid-channel"
+    if old_name == new_name:
+        return True, new_name
+    if not safe_user:
+        return False, "forbidden"
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+
+        cur.execute("SELECT 1 FROM channels WHERE name = ?", (old_name,))
+        if cur.fetchone() is None:
+            conn.close()
+            return False, "channel-not-found"
+
+        cur.execute(
+            "SELECT 1 FROM channel_members WHERE channel_name = ? AND username = ?",
+            (old_name, safe_user),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            return False, "forbidden"
+
+        cur.execute("SELECT 1 FROM channels WHERE name = ?", (new_name,))
+        if cur.fetchone() is not None:
+            conn.close()
+            return False, "channel-exists"
+
+        cur.execute("UPDATE channels SET name = ? WHERE name = ?", (new_name, old_name))
+        cur.execute(
+            "UPDATE channel_members SET channel_name = ? WHERE channel_name = ?",
+            (new_name, old_name),
+        )
+        cur.execute(
+            "UPDATE messages SET channel_name = ? WHERE channel_name = ?",
+            (new_name, old_name),
+        )
+        conn.commit()
+        conn.close()
+
+    return True, new_name
+
+
+def leave_channel(channel_name, user=""):
+    """Remove user membership from channel and cleanup empty channels."""
+    initialize_message_store()
+
+    safe_channel = str(channel_name or "").strip()
+    safe_user = str(user or "").strip()
+    if not safe_channel:
+        return False, "invalid-channel"
+    if not safe_user:
+        return False, "forbidden"
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+
+        cur.execute("SELECT 1 FROM channels WHERE name = ?", (safe_channel,))
+        if cur.fetchone() is None:
+            conn.close()
+            return False, "channel-not-found"
+
+        cur.execute(
+            "SELECT 1 FROM channel_members WHERE channel_name = ? AND username = ?",
+            (safe_channel, safe_user),
+        )
+        if cur.fetchone() is None:
+            conn.close()
+            return False, "not-member"
+
+        cur.execute(
+            "DELETE FROM channel_members WHERE channel_name = ? AND username = ?",
+            (safe_channel, safe_user),
+        )
+
+        cur.execute(
+            "SELECT COUNT(*) FROM channel_members WHERE channel_name = ?",
+            (safe_channel,),
+        )
+        member_count = int(cur.fetchone()[0])
+        removed_channel = member_count == 0
+        if removed_channel:
+            cur.execute("DELETE FROM messages WHERE channel_name = ?", (safe_channel,))
+            cur.execute("DELETE FROM channels WHERE name = ?", (safe_channel,))
+
+        conn.commit()
+        conn.close()
+
+    return True, {"channel": safe_channel, "removed_channel": removed_channel}
 
 
 def get_user_channels(user=""):

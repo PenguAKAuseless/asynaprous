@@ -8,7 +8,9 @@ from .message_store import (
     get_user_channels,
     initialize_message_store,
     is_channel_member,
+    leave_channel,
     join_channel,
+    rename_channel,
 )
 
 

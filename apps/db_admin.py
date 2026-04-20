@@ -14,6 +14,7 @@ from .chat.message_store import (
     initialize_message_store,
     reset_message_store_runtime_state,
 )
+from .chat.p2p_store import reset_p2p_store_runtime_state
 
 
 def purge_database_to_demo():
@@ -28,6 +29,8 @@ def purge_database_to_demo():
     cur.execute("DROP TABLE IF EXISTS channels")
     cur.execute("DROP TABLE IF EXISTS accounts")
     cur.execute("DROP TABLE IF EXISTS auth_sessions")
+    cur.execute("DROP TABLE IF EXISTS p2p_messages")
+    cur.execute("DROP TABLE IF EXISTS p2p_rooms")
 
     conn.commit()
     conn.close()
@@ -35,6 +38,7 @@ def purge_database_to_demo():
     reset_account_store_runtime_state()
     reset_message_store_runtime_state()
     reset_session_store_runtime_state()
+    reset_p2p_store_runtime_state()
 
     initialize_account_store()
     initialize_message_store()

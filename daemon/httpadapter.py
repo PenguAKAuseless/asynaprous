@@ -153,6 +153,8 @@ class HttpAdapter:
             "/index.html",
             "/login",
             "/login.html",
+            "/register",
+            "/register.html",
             "/form.html",
             "/echo",
             "/chat.html",
@@ -231,10 +233,50 @@ class HttpAdapter:
 
         return self._connection_uses_tls()
 
+    def _session_cookie_name(self, req):
+        """Build cookie name for session scope policy (default host+port)."""
+        scope = os.environ.get("ASYNAPROUS_SESSION_COOKIE_SCOPE", "host-port").strip().lower()
+        if scope not in {"host-port", "port"}:
+            return "session_id"
+
+        host_header = ""
+        if req and req.headers:
+            host_header = str(req.headers.get("Host", "")).strip().lower()
+
+        if not host_header:
+            return "session_id"
+
+        safe_suffix = "".join(ch if ch.isalnum() else "_" for ch in host_header)
+        if not safe_suffix:
+            return "session_id"
+
+        return "session_id_{}".format(safe_suffix)
+
+    def _candidate_session_cookie_names(self, req):
+        """Return primary cookie name plus legacy fallback for compatibility."""
+        primary = self._session_cookie_name(req)
+        names = [primary]
+        if primary != "session_id":
+            names.append("session_id")
+        return names
+
+    def _read_session_cookie(self, req):
+        """Read first available session cookie by scope policy."""
+        if not req or not req.cookies:
+            return "", ""
+
+        for cookie_name in self._candidate_session_cookie_names(req):
+            value = req.cookies.get(cookie_name)
+            if value:
+                return cookie_name, str(value)
+
+        return "", ""
+
     def _set_session_cookie(self, req, session_id, max_age):
         """Set session cookie with secure attributes based on transport policy."""
+        cookie_name = self._session_cookie_name(req)
         self.response.set_cookie(
-            "session_id",
+            cookie_name,
             session_id,
             max_age=max_age,
             path="/",
@@ -269,7 +311,7 @@ class HttpAdapter:
 
     def _authenticate_request(self, req):
         """Validate session cookie or basic credentials for protected endpoints."""
-        session_id = req.cookies.get("session_id") if req.cookies else None
+        _cookie_name, session_id = self._read_session_cookie(req)
         user_from_session = get_session_user(session_id)
         if user_from_session:
             self._attach_authenticated_user(req, user_from_session)
@@ -310,17 +352,18 @@ class HttpAdapter:
 
     def _handle_logout(self, req):
         """Clear session state and instruct browser to remove cookie."""
-        session_id = req.cookies.get("session_id") if req.cookies else None
+        _cookie_name, session_id = self._read_session_cookie(req)
         if session_id:
             remove_session(session_id)
 
-        self.response.set_cookie(
-            "session_id",
-            "deleted",
-            max_age=0,
-            path="/",
-            secure=self._should_set_secure_cookie(req),
-        )
+        for cookie_name in self._candidate_session_cookie_names(req):
+            self.response.set_cookie(
+                cookie_name,
+                "deleted",
+                max_age=0,
+                path="/",
+                secure=self._should_set_secure_cookie(req),
+            )
         self.response.headers["Cache-Control"] = "no-store"
         content = json.dumps({"status": "ok", "message": "Logged out"})
         return self.response.build_response(req, envelop_content=content)

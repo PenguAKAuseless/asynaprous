@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Register</title>
+  <style>
+    body {
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background: linear-gradient(140deg, #dff8ff, #f3f4f6 40%, #e5f3ef);
+    }
+
+    .card {
+      width: min(420px, 92vw);
+      background: white;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 14px 30px rgba(15, 23, 42, 0.16);
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: 1.45rem;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      color: #334155;
+      font-size: 0.92rem;
+    }
+
+    input {
+      width: 100%;
+      margin-top: 6px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      padding: 10px;
+      box-sizing: border-box;
+      font-size: 0.95rem;
+    }
+
+    button {
+      width: 100%;
+      border: none;
+      border-radius: 8px;
+      margin-top: 16px;
+      padding: 11px;
+      color: white;
+      background: #0f766e;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .hint {
+      margin-top: 10px;
+      font-size: 0.88rem;
+      color: #475569;
+    }
+
+    .hint a {
+      color: #0369a1;
+      text-decoration: none;
+    }
+
+    #error {
+      min-height: 1.2em;
+      margin-top: 10px;
+      color: #b91c1c;
+      font-size: 0.88rem;
+    }
+
+    #ok {
+      min-height: 1.2em;
+      margin-top: 6px;
+      color: #065f46;
+      font-size: 0.88rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Create Account</h1>
+    <form id="register-form">
+      <label>
+        Username
+        <input id="username" name="username" type="text" required>
+      </label>
+
+      <label>
+        Password
+        <input id="password" name="password" type="password" required>
+      </label>
+
+      <label>
+        Confirm Password
+        <input id="confirm-password" name="confirm_password" type="password" required>
+      </label>
+
+      <button type="submit">Register</button>
+    </form>
+
+    <div id="error"></div>
+    <div id="ok"></div>
+    <div class="hint">Already have an account? <a href="/login.html">Sign in</a></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("register-form");
+    const errorNode = document.getElementById("error");
+    const okNode = document.getElementById("ok");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      errorNode.textContent = "";
+      okNode.textContent = "";
+
+      const username = document.getElementById("username").value.trim();
+      const password = document.getElementById("password").value;
+      const confirmPassword = document.getElementById("confirm-password").value;
+
+      if (password !== confirmPassword) {
+        errorNode.textContent = "Passwords do not match.";
+        return;
+      }
+
+      try {
+        const response = await fetch("/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username,
+            password,
+            confirm_password: confirmPassword
+          })
+        });
+
+        const payload = await response.json();
+        if (!response.ok || payload.status === "error") {
+          errorNode.textContent = payload.message || "Registration failed.";
+          return;
+        }
+
+        okNode.textContent = "Account created. Redirecting to login...";
+        window.setTimeout(() => {
+          window.location.href = "/login.html";
+        }, 900);
+      } catch (error) {
+        errorNode.textContent = "Network error. Please retry.";
+      }
+    });
+  </script>
+</body>
+</html>
