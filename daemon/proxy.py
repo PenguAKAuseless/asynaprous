@@ -14,6 +14,8 @@
 
 import socket
 import threading
+import ssl
+import os
 
 RR_INDEX = {}
 rr_lock = threading.Lock()
@@ -88,8 +90,30 @@ def _extract_host(request_bytes):
 
 def forward_request(host, port, request_bytes):
     """Forward request to backend and return raw response bytes."""
-    backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    backend.settimeout(10)
+    raw_backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_backend.settimeout(10)
+
+    upstream_tls = os.environ.get("ASYNAPROUS_PROXY_UPSTREAM_TLS", "0").strip().lower()
+    use_tls = upstream_tls in {"1", "true", "yes", "on"}
+
+    backend = raw_backend
+    if use_tls:
+        verify = os.environ.get("ASYNAPROUS_PROXY_UPSTREAM_TLS_VERIFY", "0").strip().lower()
+        verify_cert = verify in {"1", "true", "yes", "on"}
+
+        context = ssl.create_default_context()
+        if verify_cert:
+            ca_file = os.environ.get("ASYNAPROUS_PROXY_UPSTREAM_TLS_CA_FILE", "").strip()
+            if ca_file:
+                context.load_verify_locations(cafile=ca_file)
+        else:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+        backend = context.wrap_socket(
+            raw_backend,
+            server_hostname=host if verify_cert else None,
+        )
 
     try:
         backend.connect((host, int(port)))
@@ -103,11 +127,14 @@ def forward_request(host, port, request_bytes):
             response += chunk
 
         return response
-    except socket.error as exc:
+    except Exception as exc:
         print("[Proxy] Forwarding error: {}".format(exc))
         return _simple_http_response("HTTP/1.1 502 Bad Gateway", "502 Bad Gateway")
     finally:
-        backend.close()
+        try:
+            backend.close()
+        except Exception:
+            pass
 
 
 def resolve_routing_policy(hostname, routes):
@@ -187,14 +214,38 @@ def handle_client(ip, port, conn, addr, routes):
 def run_proxy(ip, port, routes):
     """Start proxy process and fan-out accepted sockets using threads."""
     proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    cert_file = os.environ.get("ASYNAPROUS_PROXY_TLS_CERT_FILE", "").strip()
+    key_file = os.environ.get("ASYNAPROUS_PROXY_TLS_KEY_FILE", "").strip()
+
+    ssl_context = None
+    if cert_file or key_file:
+        if not cert_file or not key_file:
+            raise RuntimeError(
+                "Both ASYNAPROUS_PROXY_TLS_CERT_FILE and ASYNAPROUS_PROXY_TLS_KEY_FILE are required"
+            )
+
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        if hasattr(ssl_context, "minimum_version") and hasattr(ssl, "TLSVersion"):
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_context.load_cert_chain(certfile=cert_file, keyfile=key_file)
 
     try:
         proxy.bind((ip, port))
         proxy.listen(50)
         print("[Proxy] Listening on IP {} port {}".format(ip, port))
+        if ssl_context:
+            print("[Proxy] TLS enabled for inbound client connections")
 
         while True:
             conn, addr = proxy.accept()
+            if ssl_context:
+                try:
+                    conn = ssl_context.wrap_socket(conn, server_side=True)
+                except ssl.SSLError as exc:
+                    print("[Proxy] TLS handshake failed: {}".format(exc))
+                    conn.close()
+                    continue
+
             client_thread = threading.Thread(
                 target=handle_client,
                 args=(ip, port, conn, addr, routes),

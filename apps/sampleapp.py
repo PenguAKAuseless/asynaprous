@@ -52,8 +52,6 @@ def login(headers="guest", body="anonymous"):
     :param headers (str): The request headers or user identifier.
     :param body (str): The request body or login payload.
     """
-    print("[SampleApp] Login request headers={} body={}".format(headers, body))
-
     username = "anonymous"
     content_type = headers.get("Content-Type", "") if headers else ""
 
@@ -66,6 +64,8 @@ def login(headers="guest", body="anonymous"):
     elif "application/x-www-form-urlencoded" in content_type:
         form = parse_qs(body, keep_blank_values=True)
         username = form.get("username", [username])[0]
+
+    print("[SampleApp] Login request for user '{}'".format(username))
 
     data = {
         "status": "ok",

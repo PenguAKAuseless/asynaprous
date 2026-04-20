@@ -21,6 +21,7 @@ authentication checks, route dispatch, and response delivery.
 import asyncio
 import inspect
 import json
+import os
 
 from .request import Request
 from .response import Response
@@ -195,6 +196,51 @@ class HttpAdapter:
         ).format(len(body)).encode("utf-8")
         return response + body
 
+    def _connection_uses_tls(self):
+        """Best-effort check for TLS-wrapped connection in sync mode."""
+        conn = self.conn
+        if not conn:
+            return False
+
+        if hasattr(conn, "cipher"):
+            try:
+                return conn.cipher() is not None
+            except Exception:
+                return False
+
+        return False
+
+    def _should_set_secure_cookie(self, req):
+        """Determine whether session cookies should include the Secure attribute."""
+        mode = os.environ.get("ASYNAPROUS_COOKIE_SECURE", "auto").strip().lower()
+        if mode in {"1", "true", "yes", "on"}:
+            return True
+        if mode in {"0", "false", "no", "off"}:
+            return False
+
+        if req and req.headers:
+            forwarded_proto = str(req.headers.get("X-Forwarded-Proto", "")).strip()
+            if forwarded_proto:
+                first_proto = forwarded_proto.split(",", 1)[0].strip().lower()
+                if first_proto == "https":
+                    return True
+
+            forwarded = str(req.headers.get("Forwarded", "")).lower()
+            if "proto=https" in forwarded:
+                return True
+
+        return self._connection_uses_tls()
+
+    def _set_session_cookie(self, req, session_id, max_age):
+        """Set session cookie with secure attributes based on transport policy."""
+        self.response.set_cookie(
+            "session_id",
+            session_id,
+            max_age=max_age,
+            path="/",
+            secure=self._should_set_secure_cookie(req),
+        )
+
     def _invoke_hook(self, req):
         """Run route hook for sync and async handlers."""
         kwargs = {"headers": req.headers, "body": req.body}
@@ -222,11 +268,15 @@ class HttpAdapter:
             return user_from_session
 
         if isinstance(req.auth, tuple) and check_credentials(req.auth):
+            if not self._connection_uses_tls():
+                warn = os.environ.get("ASYNAPROUS_WARN_INSECURE_AUTH", "1").strip().lower()
+                if warn not in {"0", "false", "no", "off"}:
+                    print(
+                        "[Security] Basic auth accepted on non-TLS connection; credentials can be intercepted"
+                    )
             username = req.auth[0]
             session_id = create_session(username)
-            self.response.set_cookie(
-                "session_id", session_id, max_age=SESSION_TTL_SECONDS, path="/"
-            )
+            self._set_session_cookie(req, session_id, SESSION_TTL_SECONDS)
             return username
 
         return None
@@ -239,9 +289,8 @@ class HttpAdapter:
 
         username = credentials[0]
         session_id = create_session(username)
-        self.response.set_cookie(
-            "session_id", session_id, max_age=SESSION_TTL_SECONDS, path="/"
-        )
+        self._set_session_cookie(req, session_id, SESSION_TTL_SECONDS)
+        self.response.headers["Cache-Control"] = "no-store"
 
         if req.hook:
             content = self._invoke_hook(req)
@@ -256,7 +305,14 @@ class HttpAdapter:
         if session_id:
             remove_session(session_id)
 
-        self.response.set_cookie("session_id", "deleted", max_age=0, path="/")
+        self.response.set_cookie(
+            "session_id",
+            "deleted",
+            max_age=0,
+            path="/",
+            secure=self._should_set_secure_cookie(req),
+        )
+        self.response.headers["Cache-Control"] = "no-store"
         content = json.dumps({"status": "ok", "message": "Logged out"})
         return self.response.build_response(req, envelop_content=content)
 

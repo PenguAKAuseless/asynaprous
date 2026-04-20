@@ -43,6 +43,8 @@ Usage Example:
 import socket
 import threading
 import argparse
+import ssl
+import os
 
 import asyncio
 import inspect
@@ -58,6 +60,26 @@ sel = selectors.DefaultSelector()
 mode_async = "callback"
 # mode_async = "coroutine"
 mode_async = "threading"
+
+
+def _build_server_ssl_context():
+    """Build optional TLS context when cert and key are configured."""
+    cert_file = os.environ.get("ASYNAPROUS_TLS_CERT_FILE", "").strip()
+    key_file = os.environ.get("ASYNAPROUS_TLS_KEY_FILE", "").strip()
+
+    if not cert_file and not key_file:
+        return None
+
+    if not cert_file or not key_file:
+        raise RuntimeError(
+            "Both ASYNAPROUS_TLS_CERT_FILE and ASYNAPROUS_TLS_KEY_FILE are required"
+        )
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(context, "minimum_version") and hasattr(ssl, "TLSVersion"):
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    return context
 
 
 def handle_client(ip, port, conn, addr, routes):
@@ -118,7 +140,7 @@ async def handle_client_coroutine(reader, writer):
     await daemon.handle_client_coroutine(reader, writer)
 
 
-async def async_server(ip="0.0.0.0", port=7000, routes={}):
+async def async_server(ip="0.0.0.0", port=7000, routes={}, ssl_context=None):
     print("[Backend] async_server **ASYNC** listening on port {}".format(port))
     if routes != {}:
         print("[Backend] route settings")
@@ -130,7 +152,12 @@ async def async_server(ip="0.0.0.0", port=7000, routes={}):
                 "   + ('{}', '{}'): {}{}".format(key[0], key[1], isCoFunc, str(value))
             )
 
-    async_server = await asyncio.start_server(handle_client_coroutine, ip, port)
+    async_server = await asyncio.start_server(
+        handle_client_coroutine,
+        ip,
+        port,
+        ssl=ssl_context,
+    )
     async with async_server:
         await async_server.serve_forever()
     return
@@ -151,9 +178,13 @@ def run_backend(ip, port, routes):
     global mode_async
 
     print("[Backend] run_backend with routes={}".format(routes))
+    ssl_context = _build_server_ssl_context()
+    if ssl_context:
+        print("[Backend] TLS enabled for inbound connections")
+
     # Process async stream for registering the service and terminate
     if mode_async == "coroutine":
-        asyncio.run(async_server(ip, port, routes))
+        asyncio.run(async_server(ip, port, routes, ssl_context=ssl_context))
         return
 
     # Process socket object
@@ -199,6 +230,13 @@ def run_backend(ip, port, routes):
                     callback, ip, port, routes = key.data
                     # Accept connection
                     conn, addr = key.fileobj.accept()
+                    if ssl_context:
+                        try:
+                            conn = ssl_context.wrap_socket(conn, server_side=True)
+                        except ssl.SSLError as exc:
+                            print("[Backend] TLS handshake failed: {}".format(exc))
+                            conn.close()
+                            continue
                     # Adapter uses regular recv loop, so keep client socket blocking.
                     conn.setblocking(True)
                     # Invoke the callback to handle the client connection
@@ -207,6 +245,13 @@ def run_backend(ip, port, routes):
         else: # mode multi-thread
             while True:
                 conn, addr = server.accept()
+                if ssl_context:
+                    try:
+                        conn = ssl_context.wrap_socket(conn, server_side=True)
+                    except ssl.SSLError as exc:
+                        print("[Backend] TLS handshake failed: {}".format(exc))
+                        conn.close()
+                        continue
                 # Create a thread to handle the client connection
                 client_thread = threading.Thread(
                     target=handle_client, args=(ip, port, conn, addr, routes)

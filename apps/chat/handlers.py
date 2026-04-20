@@ -3,6 +3,8 @@
 import json
 import socket
 import threading
+import ssl
+import os
 
 from .channel_service import (
     add_message,
@@ -38,6 +40,7 @@ def _parse_json(body):
 
 def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", timeout=5):
     """Send an HTTP POST request to target peer and return delivery result."""
+    sock = None
     try:
         body = json.dumps(payload)
         request = (
@@ -49,8 +52,31 @@ def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", ti
             "{}"
         ).format(endpoint, target_ip, target_port, len(body.encode("utf-8")), body)
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+
+        peer_tls = os.environ.get("ASYNAPROUS_PEER_TLS", "0").strip().lower()
+        use_tls = peer_tls in {"1", "true", "yes", "on"}
+
+        sock = raw_sock
+        if use_tls:
+            verify = os.environ.get("ASYNAPROUS_PEER_TLS_VERIFY", "0").strip().lower()
+            verify_cert = verify in {"1", "true", "yes", "on"}
+
+            context = ssl.create_default_context()
+            if verify_cert:
+                ca_file = os.environ.get("ASYNAPROUS_PEER_TLS_CA_FILE", "").strip()
+                if ca_file:
+                    context.load_verify_locations(cafile=ca_file)
+            else:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+
+            sock = context.wrap_socket(
+                raw_sock,
+                server_hostname=target_ip if verify_cert else None,
+            )
+
         sock.connect((target_ip, int(target_port)))
         sock.sendall(request.encode("utf-8"))
 
@@ -60,11 +86,16 @@ def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", ti
             if not chunk:
                 break
 
-        sock.close()
         return True
     except Exception as exc:
         print("[P2P Error] {}".format(exc))
         return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def _extract_peer_payload(data):
