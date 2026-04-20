@@ -161,7 +161,7 @@ def create_channel(channel_name, creator="me"):
 
 
 def join_channel(channel_name, user="me"):
-    """Register user membership for a channel; create metadata if missing."""
+    """Register user membership for an existing channel."""
     initialize_message_store()
 
     safe_channel = str(channel_name or "").strip()
@@ -173,13 +173,11 @@ def join_channel(channel_name, user="me"):
     with _db_lock:
         conn = _connect()
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO channels (name, created_by, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (safe_channel, safe_user or "me", now),
-        )
+        cur.execute("SELECT 1 FROM channels WHERE name = ?", (safe_channel,))
+        if cur.fetchone() is None:
+            conn.close()
+            return False, "channel-not-found"
+
         cur.execute(
             """
             INSERT OR IGNORE INTO channel_members (channel_name, username, joined_at)
@@ -194,20 +192,16 @@ def join_channel(channel_name, user="me"):
 
 
 def get_user_channels(user=""):
-    """Return channels joined by user. If omitted, return all channels."""
+    """Return channels joined by user."""
     initialize_message_store()
     safe_user = str(user or "").strip()
+
+    if not safe_user:
+        return []
 
     with _db_lock:
         conn = _connect()
         cur = conn.cursor()
-
-        if not safe_user:
-            cur.execute("SELECT name FROM channels ORDER BY name ASC")
-            rows = cur.fetchall()
-            conn.close()
-            return [row[0] for row in rows]
-
         cur.execute(
             """
             SELECT channel_name
@@ -221,6 +215,33 @@ def get_user_channels(user=""):
         conn.close()
 
     return [row[0] for row in rows]
+
+
+def is_channel_member(channel_name, user):
+    """Return True only when user is a member of channel."""
+    initialize_message_store()
+
+    safe_channel = str(channel_name or "").strip()
+    safe_user = str(user or "").strip()
+    if not safe_channel or not safe_user:
+        return False
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM channel_members
+            WHERE channel_name = ? AND username = ?
+            LIMIT 1
+            """,
+            (safe_channel, safe_user),
+        )
+        found = cur.fetchone() is not None
+        conn.close()
+
+    return found
 
 
 def get_messages(channel_name):

@@ -12,6 +12,7 @@ from .channel_service import (
     get_channels,
     get_messages,
     get_user_channels,
+    is_channel_member,
     join_channel,
 )
 from .peer_service import add_peer_info, get_all_peers, get_peer_info
@@ -36,6 +37,13 @@ def _parse_json(body):
         return json.loads(body)
     except json.JSONDecodeError:
         return None
+
+
+def _authenticated_user(headers):
+    """Read authenticated username propagated by HTTP adapter."""
+    if not headers:
+        return ""
+    return str(headers.get("X-Authenticated-User", "")).strip()
 
 
 def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", timeout=5):
@@ -135,14 +143,14 @@ def handle_connect_peer(headers, body):
 
 def handle_send_peer(headers, body):
     """Handle /send-peer direct peer-to-peer message delivery."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     peer_id = data.get("to_peer")
     message = str(data.get("message", "")).strip()
-    sender = data.get("sender", "me")
+    sender = auth_user or data.get("sender", "me")
 
     if not peer_id or not message:
         return _json(build_error("missing-fields", "Missing to_peer or message"))
@@ -166,13 +174,13 @@ def handle_send_peer(headers, body):
 
 def handle_broadcast_peer(headers, body):
     """Handle /broadcast-peer for fan-out to all connected peers."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     message = str(data.get("message", "")).strip()
-    sender = data.get("sender", "me")
+    sender = auth_user or data.get("sender", "me")
     if not message:
         return _json(build_error("missing-message", "Missing message"))
 
@@ -218,25 +226,30 @@ def handle_get_channels(headers, body):
 
 def handle_get_user_channels(headers, body):
     """Handle POST /api/my-channels."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    user = str(data.get("user", "")).strip()
-    channels = get_user_channels(user)
-    return _json({"status": "ok", "channels": channels})
+    channels = get_user_channels(auth_user)
+    return _json({"status": "ok", "user": auth_user, "channels": channels})
 
 
 def handle_create_channel(headers, body):
     """Handle POST /api/create-channel."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     channel = str(data.get("channel", "")).strip()
-    user = str(data.get("user", "me")).strip()
+    user = auth_user
 
     created, info = create_channel(channel, user)
     if info == "invalid-channel":
@@ -251,13 +264,16 @@ def handle_create_channel(headers, body):
 
 def handle_join_channel(headers, body):
     """Handle POST /api/join-channel."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     channel = str(data.get("channel", "")).strip()
-    user = str(data.get("user", "me")).strip()
+    user = auth_user
 
     ok, info = join_channel(channel, user)
     if not ok:
@@ -270,24 +286,33 @@ def handle_join_channel(headers, body):
 
 def handle_get_channel_msgs(headers, body):
     """Handle POST /api/get-messages."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    channel = data.get("channel", "general")
+    channel = str(data.get("channel", "general")).strip() or "general"
+    if not is_channel_member(channel, auth_user):
+        return _json(build_error("forbidden", "You are not a member of this channel"))
+
     return _json(get_messages(channel))
 
 
 def handle_send_channel_msg(headers, body):
     """Handle POST /api/send-channel and replicate to connected peers."""
-    _ = headers
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    channel = data.get("channel", "general")
-    sender = str(data.get("sender", "me"))
+    channel = str(data.get("channel", "general")).strip() or "general"
+    sender = auth_user
     message = str(data.get("message", "")).strip()
 
     if not message:

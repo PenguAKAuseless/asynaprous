@@ -7,6 +7,7 @@ from .message_store import (
     get_messages,
     get_user_channels,
     initialize_message_store,
+    is_channel_member,
     join_channel,
 )
 

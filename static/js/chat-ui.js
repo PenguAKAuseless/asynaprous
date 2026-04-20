@@ -1,9 +1,13 @@
-let currentChannel = "general";
-let localMessageCount = 0;
-const currentUser = localStorage.getItem("chatUser") || "me";
+let currentChannel = "";
+let currentUser = "";
+const messageCountByChannel = new Map();
+let latestPollId = 0;
 
 async function apiJson(url, options = {}) {
-    const response = await fetch(url, options);
+    const response = await fetch(url, {
+        credentials: "same-origin",
+        ...options
+    });
 
     if (response.status === 401) {
         window.location.href = "/login.html";
@@ -15,19 +19,33 @@ async function apiJson(url, options = {}) {
         throw new Error(text || `Request failed: ${response.status}`);
     }
 
-    return response.json();
+    const payload = await response.json();
+    if (
+        payload &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        payload.status === "error"
+    ) {
+        const errorMessage =
+            payload.error && payload.error.message
+                ? payload.error.message
+                : "Request failed";
+        throw new Error(errorMessage);
+    }
+
+    return payload;
 }
 
 async function loadChannels() {
     try {
-        const payload = { user: currentUser };
         const data = await apiJson("/api/my-channels", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: "{}"
         });
 
-        const channels = data.channels || [];
+        currentUser = String(data.user || "").trim();
+        const channels = Array.isArray(data.channels) ? data.channels : [];
         const list = document.getElementById("channel-list");
         list.replaceChildren();
 
@@ -38,8 +56,17 @@ async function loadChannels() {
             list.appendChild(li);
         });
 
-        if (channels.length > 0) {
+        if (channels.length === 0) {
+            currentChannel = "";
+            document.getElementById("current-channel").textContent = "# no channel";
+            renderMessages([]);
+            return;
+        }
+
+        if (!channels.includes(currentChannel)) {
             selectChannel(channels[0]);
+        } else {
+            pollMessages(true);
         }
     } catch (error) {
         console.error("loadChannels failed", error);
@@ -47,23 +74,40 @@ async function loadChannels() {
 }
 
 function selectChannel(channel) {
+    if (!channel) {
+        return;
+    }
+
     currentChannel = channel;
     document.getElementById("current-channel").textContent = "# " + channel;
-    localMessageCount = 0;
-    pollMessages();
+    renderMessages([]);
+    pollMessages(true);
 }
 
-async function pollMessages() {
+async function pollMessages(forceRender = false) {
+    if (!currentChannel) {
+        return;
+    }
+
+    const channelAtRequest = currentChannel;
+    const pollId = ++latestPollId;
+
     try {
         const messages = await apiJson("/api/get-messages", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ channel: currentChannel })
+            body: JSON.stringify({ channel: channelAtRequest })
         });
 
-        if (messages.length >= localMessageCount) {
-            localMessageCount = messages.length;
-            renderMessages(messages);
+        if (pollId !== latestPollId || channelAtRequest !== currentChannel) {
+            return;
+        }
+
+        const safeMessages = Array.isArray(messages) ? messages : [];
+        const previousCount = messageCountByChannel.get(channelAtRequest);
+        if (forceRender || previousCount !== safeMessages.length) {
+            messageCountByChannel.set(channelAtRequest, safeMessages.length);
+            renderMessages(safeMessages);
         }
     } catch (error) {
         console.error("pollMessages failed", error);
@@ -84,13 +128,15 @@ function renderMessages(messages) {
 
         const senderSpan = document.createElement("span");
         senderSpan.className = "msg-sender";
-        senderSpan.textContent = `${message.sender}:`;
+        const sender = String(message.sender || "anonymous");
+        const senderLabel = currentUser && sender === currentUser ? "me" : sender;
+        senderSpan.textContent = `${senderLabel}:`;
 
         div.appendChild(timeSpan);
         div.appendChild(document.createTextNode(" "));
         div.appendChild(senderSpan);
         div.appendChild(document.createTextNode(" "));
-        div.appendChild(document.createTextNode(message.message));
+        div.appendChild(document.createTextNode(String(message.message || "")));
 
         container.appendChild(div);
     });
@@ -99,6 +145,10 @@ function renderMessages(messages) {
 }
 
 async function sendMessage() {
+    if (!currentChannel) {
+        return;
+    }
+
     const input = document.getElementById("msg-input");
     const message = input.value.trim();
     if (!message) {
@@ -111,13 +161,12 @@ async function sendMessage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 channel: currentChannel,
-                message,
-                sender: currentUser
+                message
             })
         });
 
         input.value = "";
-        pollMessages();
+        pollMessages(true);
     } catch (error) {
         console.error("sendMessage failed", error);
     }
@@ -134,7 +183,7 @@ async function createChannel() {
         await apiJson("/api/create-channel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ channel, user: currentUser })
+            body: JSON.stringify({ channel })
         });
 
         input.value = "";
@@ -156,7 +205,7 @@ async function joinChannel() {
         await apiJson("/api/join-channel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ channel, user: currentUser })
+            body: JSON.stringify({ channel })
         });
 
         input.value = "";
@@ -167,7 +216,20 @@ async function joinChannel() {
     }
 }
 
+function bindSendOnEnter() {
+    const input = document.getElementById("msg-input");
+    input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            sendMessage();
+        }
+    });
+}
+
 window.onload = () => {
+    bindSendOnEnter();
     loadChannels();
-    setInterval(pollMessages, 2000);
+    setInterval(() => {
+        pollMessages(false);
+    }, 2000);
 };

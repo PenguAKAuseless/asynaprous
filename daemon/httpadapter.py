@@ -260,11 +260,19 @@ class HttpAdapter:
 
         return None
 
+    def _attach_authenticated_user(self, req, username):
+        """Attach authenticated user to request headers for route handlers."""
+        if not req or not username:
+            return
+
+        req.headers["X-Authenticated-User"] = str(username)
+
     def _authenticate_request(self, req):
         """Validate session cookie or basic credentials for protected endpoints."""
         session_id = req.cookies.get("session_id") if req.cookies else None
         user_from_session = get_session_user(session_id)
         if user_from_session:
+            self._attach_authenticated_user(req, user_from_session)
             return user_from_session
 
         if isinstance(req.auth, tuple) and check_credentials(req.auth):
@@ -277,6 +285,7 @@ class HttpAdapter:
             username = req.auth[0]
             session_id = create_session(username)
             self._set_session_cookie(req, session_id, SESSION_TTL_SECONDS)
+            self._attach_authenticated_user(req, username)
             return username
 
         return None
