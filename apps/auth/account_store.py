@@ -471,3 +471,75 @@ def get_username_for_peer_id(peer_id):
         return ""
 
     return str(row[0] or "").strip()
+
+
+def search_accounts(query="", limit=20, exclude_username=""):
+    """Search accounts by username or peer id and return public identity rows."""
+    initialize_account_store()
+
+    safe_query = str(query or "").strip().lower()
+    safe_exclude = _normalize_username(exclude_username)
+
+    try:
+        safe_limit = int(limit)
+    except (TypeError, ValueError):
+        safe_limit = 20
+
+    if safe_limit < 1:
+        safe_limit = 1
+    if safe_limit > 100:
+        safe_limit = 100
+
+    where_clauses = []
+    params = []
+
+    if safe_exclude:
+        where_clauses.append("username != ?")
+        params.append(safe_exclude)
+
+    if safe_query:
+        like_pattern = "%{}%".format(safe_query)
+        where_clauses.append("(LOWER(username) LIKE ? OR LOWER(peer_id) LIKE ?)")
+        params.extend([like_pattern, like_pattern])
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = " WHERE " + " AND ".join(where_clauses)
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT username, peer_id
+            FROM accounts
+            {}
+            ORDER BY username ASC
+            LIMIT ?
+            """.format(where_sql),
+            params + [safe_limit],
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+    result = []
+    for username, peer_id in rows:
+        safe_username = _normalize_username(username)
+        if not safe_username:
+            continue
+
+        safe_peer_id = str(peer_id or "").strip().lower()
+        if not safe_peer_id:
+            safe_peer_id = str(get_peer_id_for_user(safe_username) or "").strip().lower()
+
+        if not safe_peer_id:
+            continue
+
+        result.append(
+            {
+                "username": safe_username,
+                "peer_id": safe_peer_id,
+            }
+        )
+
+    return result

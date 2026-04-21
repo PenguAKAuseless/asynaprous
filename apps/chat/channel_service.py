@@ -3,6 +3,7 @@
 from .message_store import (
     add_message,
     create_channel,
+    get_channel_members,
     get_channels,
     get_messages,
     get_user_channels,

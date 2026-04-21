@@ -8,6 +8,7 @@ import time
 from .channel_service import (
     add_message,
     create_channel,
+    get_channel_members,
     get_channels,
     get_messages,
     get_user_channels,
@@ -16,7 +17,11 @@ from .channel_service import (
     join_channel,
     rename_channel,
 )
-from apps.auth.account_store import get_peer_id_for_user, get_username_for_peer_id
+from apps.auth.account_store import (
+    get_peer_id_for_user,
+    get_username_for_peer_id,
+    search_accounts,
+)
 from .protocol import build_error
 
 
@@ -32,6 +37,10 @@ DEFAULT_SIGNAL_POLL_SECONDS = 25
 
 SIGNAL_EVENT_TTL_SECONDS = 180
 MAX_SIGNAL_EVENTS_PER_PEER = 400
+
+MIN_PEER_SEARCH_LIMIT = 1
+MAX_PEER_SEARCH_LIMIT = 100
+DEFAULT_PEER_SEARCH_LIMIT = 25
 
 
 _presence_lock = threading.Lock()
@@ -81,6 +90,10 @@ def _safe_int(value, default, minimum, maximum):
 def _normalize_peer_id(peer_id):
     """Normalize peer IDs for consistent comparisons and DB lookups."""
     return str(peer_id or "").strip().lower()
+
+
+def _normalize_username(username):
+    return str(username or "").strip().lower()
 
 
 def _authenticated_user(headers):
@@ -146,6 +159,11 @@ def _collect_online_peers(exclude_peer_id=""):
 
     peers.sort(key=lambda item: (item["user_id"], item["peer_id"]))
     return peers
+
+
+def _collect_online_peer_ids():
+    """Return a set of currently-online peer ids from in-memory presence."""
+    return {item.get("peer_id", "") for item in _collect_online_peers() if item.get("peer_id", "")}
 
 
 def _channel_version(channel_name):
@@ -236,6 +254,47 @@ def _queue_signal_event(signal_type, from_user, from_peer_id, to_peer_id, payloa
         _signal_condition.notify_all()
 
     return event["event_id"]
+
+
+def _queue_channel_update_signals(channel_name, from_user, from_peer_id, seq):
+    """Notify online members that a channel changed to trigger client re-poll."""
+    safe_channel = str(channel_name or "").strip()
+    safe_from_peer = _normalize_peer_id(from_peer_id)
+    if not safe_channel:
+        return 0
+
+    online_peer_ids = _collect_online_peer_ids()
+    if not online_peer_ids:
+        return 0
+
+    member_usernames = get_channel_members(safe_channel)
+    notified = 0
+
+    for username in member_usernames:
+        safe_username = _normalize_username(username)
+        if not safe_username or safe_username == _normalize_username(from_user):
+            continue
+
+        target_peer_id = _normalize_peer_id(get_peer_id_for_user(safe_username))
+        if not target_peer_id or target_peer_id == safe_from_peer:
+            continue
+
+        if target_peer_id not in online_peer_ids:
+            continue
+
+        _queue_signal_event(
+            "channel-update",
+            from_user,
+            safe_from_peer,
+            target_peer_id,
+            {
+                "channel": safe_channel,
+                "seq": int(seq),
+            },
+        )
+        notified += 1
+
+    return notified
 
 
 def _sanitize_signal_event(event):
@@ -456,7 +515,7 @@ def handle_get_channel_msgs(headers, body):
 
 def handle_send_channel_msg(headers, body):
     """Handle POST /api/send-channel and persist to central channel history."""
-    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
     if unauthorized:
         return unauthorized
 
@@ -477,8 +536,17 @@ def handle_send_channel_msg(headers, body):
 
     stored = add_message(channel, auth_user, message)
     seq = _bump_channel_version(channel)
+    notified_peers = _queue_channel_update_signals(channel, auth_user, auth_peer_id, seq)
 
-    return _json({"status": "ok", "channel": channel, "seq": seq, "message": stored})
+    return _json(
+        {
+            "status": "ok",
+            "channel": channel,
+            "seq": seq,
+            "message": stored,
+            "notified_peers": notified_peers,
+        }
+    )
 
 
 def handle_channel_long_poll(headers, body):
@@ -540,8 +608,54 @@ def handle_get_online_peers(headers, body):
     return _json({"status": "ok", "peer_id": auth_peer_id, "peers": peers})
 
 
+def handle_search_peers(headers, body):
+    """Handle POST /api/peers/search via account DB plus live online flag."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
+
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    query = str(data.get("query", "")).strip()
+    limit = _safe_int(
+        data.get("limit", DEFAULT_PEER_SEARCH_LIMIT),
+        DEFAULT_PEER_SEARCH_LIMIT,
+        MIN_PEER_SEARCH_LIMIT,
+        MAX_PEER_SEARCH_LIMIT,
+    )
+    online_only = bool(data.get("online_only", False))
+
+    account_rows = search_accounts(query=query, limit=limit, exclude_username=auth_user)
+    online_peer_ids = _collect_online_peer_ids()
+
+    peers = []
+    for item in account_rows:
+        peer_id = _normalize_peer_id(item.get("peer_id", ""))
+        username = _normalize_username(item.get("username", ""))
+
+        if not peer_id or not username or peer_id == auth_peer_id:
+            continue
+
+        is_online = peer_id in online_peer_ids
+        if online_only and not is_online:
+            continue
+
+        peers.append(
+            {
+                "peer_id": peer_id,
+                "user_id": username,
+                "online": is_online,
+            }
+        )
+
+    peers.sort(key=lambda item: (not item["online"], item["user_id"], item["peer_id"]))
+    return _json({"status": "ok", "peer_id": auth_peer_id, "peers": peers})
+
+
 def handle_resolve_peer(headers, body):
-    """Handle POST /api/peer/resolve for explicit peer-id lookups."""
+    """Handle POST /api/peer/resolve for username or peer-id lookups."""
     auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
     if unauthorized:
         return unauthorized
@@ -552,18 +666,35 @@ def handle_resolve_peer(headers, body):
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    peer_id = _normalize_peer_id(data.get("peer_id", ""))
-    if not peer_id:
-        return _json(build_error("missing-fields", "peer_id is required"))
+    lookup_query = str(
+        data.get(
+            "query",
+            data.get("peer_id", data.get("username", data.get("user_id", ""))),
+        )
+    ).strip()
+    if not lookup_query:
+        return _json(build_error("missing-fields", "query is required"))
+
+    peer_id = ""
+    username = ""
+
+    normalized_query = lookup_query.lower()
+    if normalized_query.startswith("peer_"):
+        peer_id = _normalize_peer_id(normalized_query)
+        username = _normalize_username(get_username_for_peer_id(peer_id))
+    else:
+        username = _normalize_username(normalized_query)
+        peer_id = _normalize_peer_id(get_peer_id_for_user(username))
+        if peer_id and not username:
+            username = _normalize_username(get_username_for_peer_id(peer_id))
 
     if peer_id == auth_peer_id:
         return _json(build_error("invalid-peer", "Cannot start P2P with yourself"))
 
-    username = get_username_for_peer_id(peer_id)
-    if not username:
+    if not peer_id or not username:
         return _json(build_error("peer-not-found", "Peer not found"))
 
-    online = any(item.get("peer_id") == peer_id for item in _collect_online_peers())
+    online = peer_id in _collect_online_peer_ids()
     return _json(
         {
             "status": "ok",

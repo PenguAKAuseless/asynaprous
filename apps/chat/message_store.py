@@ -306,6 +306,32 @@ def get_user_channels(user=""):
     return [row[0] for row in rows]
 
 
+def get_channel_members(channel_name):
+    """Return usernames currently joined to a channel."""
+    initialize_message_store()
+
+    safe_channel = str(channel_name or "").strip()
+    if not safe_channel:
+        return []
+
+    with _db_lock:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT username
+            FROM channel_members
+            WHERE channel_name = ?
+            ORDER BY username ASC
+            """,
+            (safe_channel,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+    return [str(row[0] or "").strip() for row in rows if str(row[0] or "").strip()]
+
+
 def is_channel_member(channel_name, user):
     """Return True only when user is a member of channel."""
     initialize_message_store()

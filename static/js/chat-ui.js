@@ -10,7 +10,6 @@ const P2P_MESSAGE_LIMIT = 2000;
 const SIGNAL_POLL_TIMEOUT_SECONDS = 25;
 const CHANNEL_POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 1400;
-const PEER_ID_PATTERN = /^peer_[a-z0-9]{8,64}$/;
 
 const RTC_CONFIG = {
     iceServers: [
@@ -47,6 +46,9 @@ let signalLastEventId = 0;
 let channelLoopToken = 0;
 let peerCatalogRefreshInFlight = false;
 let lastPeerCatalogRefreshAtMs = 0;
+let peerDbSearchInFlight = false;
+let lastPeerDbSearchQuery = "";
+let lastPeerDbSearchAtMs = 0;
 
 let channelSeqById = {};
 let channelMessagesById = {};
@@ -540,16 +542,16 @@ function findKnownPeerExact(query) {
     );
 }
 
-async function resolvePeerIdFromServer(peerId) {
-    const safePeerId = normalizePeerId(peerId);
-    if (!safePeerId) {
+async function resolvePeerFromServer(query) {
+    const safeQuery = normalizeText(query);
+    if (!safeQuery) {
         return null;
     }
 
     const data = await apiJson("/api/peer/resolve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ peer_id: safePeerId })
+        body: JSON.stringify({ query: safeQuery })
     });
 
     const peer = data && typeof data === "object" ? data.peer : null;
@@ -567,6 +569,44 @@ async function resolvePeerIdFromServer(peerId) {
         user_id: normalizeText(peer.user_id) || resolvedPeerId,
         online: Boolean(peer.online)
     };
+}
+
+async function maybeSearchPeersInDatabase(query, force = false) {
+    const safeQuery = normalizeText(query).toLowerCase();
+    if (!safeQuery) {
+        return;
+    }
+
+    const nowMs = Date.now();
+    if (!force) {
+        if (peerDbSearchInFlight) {
+            return;
+        }
+
+        if (safeQuery === lastPeerDbSearchQuery && nowMs - lastPeerDbSearchAtMs < 2000) {
+            return;
+        }
+    }
+
+    peerDbSearchInFlight = true;
+    try {
+        const data = await apiJson("/api/peers/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: safeQuery, limit: 30, online_only: false })
+        });
+
+        const peers = data && typeof data === "object" && Array.isArray(data.peers) ? data.peers : [];
+        if (peers.length > 0) {
+            setKnownPeers(peers, { merge: true });
+        }
+        lastPeerDbSearchQuery = safeQuery;
+        lastPeerDbSearchAtMs = Date.now();
+    } catch (error) {
+        console.error("database peer search failed", error);
+    } finally {
+        peerDbSearchInFlight = false;
+    }
 }
 
 async function tryAddPeerFromSearchInput() {
@@ -590,15 +630,9 @@ async function tryAddPeerFromSearchInput() {
         return true;
     }
 
-    const safePeerId = normalizePeerId(query);
-    if (!PEER_ID_PATTERN.test(safePeerId)) {
-        showToast("Peer not found. Use full peer ID (peer_...) or pick from results.", true);
-        return false;
-    }
-
-    const resolvedPeer = await resolvePeerIdFromServer(safePeerId);
+    const resolvedPeer = await resolvePeerFromServer(query);
     if (!resolvedPeer) {
-        showToast("Peer ID not found", true);
+        showToast("Peer not found in account database", true);
         return false;
     }
 
@@ -1119,24 +1153,33 @@ function renderPeerSearchResults() {
     }
 
     const query = normalizeText(document.getElementById("peer-search-input").value).toLowerCase();
-    if (!query) {
-        list.classList.remove("visible");
-        return;
-    }
 
     const matches = knownPeers.filter((peer) => {
         const peerId = normalizePeerId(peer.peer_id);
         const userId = normalizeText(peer.user_id);
-        const matchesQuery = peerId.toLowerCase().includes(query) || userId.toLowerCase().includes(query);
-        return matchesQuery && peerId !== localPeerId && !selectedPeerIds.includes(peerId);
+        if (!peerId || peerId === localPeerId || selectedPeerIds.includes(peerId)) {
+            return false;
+        }
+
+        if (!query) {
+            return Boolean(peer.online);
+        }
+
+        const matchesQuery = peerId.includes(query) || userId.toLowerCase().includes(query);
+        return matchesQuery;
     });
 
     if (matches.length === 0) {
-        void refreshPeerCatalogForSearch(false);
+        if (query) {
+            void maybeSearchPeersInDatabase(query, false);
+        } else {
+            void refreshPeerCatalogForSearch(false);
+        }
+
         const empty = document.createElement("li");
-        empty.textContent = PEER_ID_PATTERN.test(query)
-            ? "No online match. Press Enter to add this peer ID."
-            : "No peer found";
+        empty.textContent = query
+            ? "No peer found. Press Enter to resolve from database."
+            : "No online peers yet";
         list.appendChild(empty);
         list.classList.add("visible");
         return;
@@ -1730,8 +1773,37 @@ async function processSignalEvent(event) {
         return;
     }
 
+    if (type === "channel-update") {
+        await handleChannelUpdateSignal(event);
+        return;
+    }
+
     if (type === "candidate") {
         await handleSignalCandidate(event);
+    }
+}
+
+async function handleChannelUpdateSignal(event) {
+    const payload = event && typeof event === "object" ? event.payload : null;
+    const channel = normalizeText(payload && payload.channel);
+    if (!channel) {
+        return;
+    }
+
+    const seqValue = Number(payload && payload.seq);
+    if (Number.isFinite(seqValue)) {
+        const currentSeq = Number(channelSeqById[channel]);
+        const suggestedLastSeq = Math.max(-1, Math.floor(seqValue) - 1);
+        if (!Number.isFinite(currentSeq) || currentSeq < suggestedLastSeq) {
+            channelSeqById[channel] = suggestedLastSeq;
+        }
+    }
+
+    startChannelLongPollLoop();
+
+    if (currentTarget.mode === MODE_CHANNEL && currentTarget.id === channel) {
+        delete channelMessagesById[channel];
+        await refreshCurrentMessages();
     }
 }
 
@@ -1748,7 +1820,7 @@ async function handleIncomingP2PData(fromPeerId, rawData) {
         return;
     }
 
-    const senderPeerId = normalizeText(payload.sender_peer_id) || normalizeText(fromPeerId);
+    const senderPeerId = normalizePeerId(payload.sender_peer_id) || normalizePeerId(fromPeerId);
     const messageText = normalizeText(payload.message);
     if (!senderPeerId || !messageText) {
         return;
@@ -1967,21 +2039,35 @@ async function sendMessage() {
     try {
         if (currentTarget.mode === MODE_CHANNEL) {
             const channel = currentTarget.id;
-            await apiJson("/api/send-channel", {
+            const response = await apiJson("/api/send-channel", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ channel, message })
             });
 
-            const snapshot = await apiJson("/api/get-messages", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ channel })
-            });
+            const stored = response && typeof response === "object" ? response.message : null;
+            if (stored && typeof stored === "object") {
+                const cached = Array.isArray(channelMessagesById[channel]) ? channelMessagesById[channel].slice() : [];
+                cached.push(stored);
+                channelMessagesById[channel] = cached;
+            } else {
+                const snapshot = await apiJson("/api/get-messages", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ channel })
+                });
+                channelMessagesById[channel] = Array.isArray(snapshot) ? snapshot : [];
+            }
 
-            channelMessagesById[channel] = Array.isArray(snapshot) ? snapshot : [];
-            channelSeqById[channel] = -1;
-            await refreshCurrentMessages();
+            if (response && typeof response.seq === "number") {
+                channelSeqById[channel] = response.seq;
+            }
+
+            if (currentTarget.mode === MODE_CHANNEL && currentTarget.id === channel) {
+                renderMessages(channelMessagesById[channel]);
+            }
+
+            startChannelLongPollLoop();
         } else {
             await sendP2PMessage(currentTarget.id, message);
         }
@@ -2163,6 +2249,10 @@ function bindUi() {
 
     document.getElementById("peer-search-input").addEventListener("input", () => {
         renderPeerSearchResults();
+        const query = normalizeText(document.getElementById("peer-search-input").value);
+        if (query) {
+            void maybeSearchPeersInDatabase(query, false);
+        }
     });
 
     document.getElementById("peer-search-input").addEventListener("keydown", (event) => {
