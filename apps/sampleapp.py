@@ -42,6 +42,7 @@ from .chat.handlers import (
     handle_signal_candidate,
     handle_signal_offer,
     handle_signal_poll,
+    handle_signal_room,
 )
 
 app = AsynapRous()
@@ -220,6 +221,11 @@ def api_signal_answer(headers, body):
 @app.route("/api/signal/candidate", methods=["POST"])
 def api_signal_candidate(headers, body):
     return handle_signal_candidate(headers, body)
+
+
+@app.route("/api/signal/room", methods=["POST"])
+def api_signal_room(headers, body):
+    return handle_signal_room(headers, body)
 
 
 @app.route("/api/signal/poll", methods=["POST"])

@@ -1477,6 +1477,38 @@ function flushPendingOutgoingMessages(state) {
     }
 }
 
+function shouldReplacePeerConnectionState(state) {
+    if (!state || !state.pc) {
+        return true;
+    }
+
+    const signalingState = state.pc.signalingState;
+    const connectionState = state.pc.connectionState;
+    return signalingState === "closed" || connectionState === "failed" || connectionState === "closed";
+}
+
+function closePeerConnectionState(state) {
+    if (!state) {
+        return;
+    }
+
+    try {
+        if (state.channel && state.channel.readyState !== "closed") {
+            state.channel.close();
+        }
+    } catch (_error) {
+        // best effort cleanup
+    }
+
+    try {
+        if (state.pc && state.pc.signalingState !== "closed") {
+            state.pc.close();
+        }
+    } catch (_error) {
+        // best effort cleanup
+    }
+}
+
 function ensurePeerConnection(peerId, options = {}) {
     const safePeerId = normalizePeerId(peerId);
     if (!safePeerId || safePeerId === localPeerId) {
@@ -1484,6 +1516,20 @@ function ensurePeerConnection(peerId, options = {}) {
     }
 
     let state = peerConnections.get(safePeerId);
+    let carryRoomIds = [];
+    let carryPendingOutgoing = [];
+
+    if (state && shouldReplacePeerConnectionState(state)) {
+        carryRoomIds = Array.from(state.roomIds || []);
+        carryPendingOutgoing = Array.isArray(state.pendingOutgoingMessages)
+            ? state.pendingOutgoingMessages.slice()
+            : [];
+
+        closePeerConnectionState(state);
+        peerConnections.delete(safePeerId);
+        state = null;
+    }
+
     if (!state) {
         const pc = new RTCPeerConnection(RTC_CONFIG);
         state = {
@@ -1491,9 +1537,10 @@ function ensurePeerConnection(peerId, options = {}) {
             pc,
             channel: null,
             pendingRemoteCandidates: [],
-            pendingOutgoingMessages: [],
-            roomIds: new Set(),
-            isNegotiating: false
+            pendingOutgoingMessages: carryPendingOutgoing,
+            roomIds: new Set(carryRoomIds),
+            isNegotiating: false,
+            lastOfferSentAtMs: 0
         };
 
         pc.onicecandidate = (event) => {
@@ -1521,8 +1568,10 @@ function ensurePeerConnection(peerId, options = {}) {
 
         pc.onconnectionstatechange = () => {
             const stateName = pc.connectionState;
-            if (stateName === "failed") {
-                console.warn(`p2p connection failed: ${safePeerId}`);
+            if (stateName === "failed" || stateName === "closed") {
+                console.warn(`p2p connection ${stateName}: ${safePeerId}`);
+            } else if (stateName === "disconnected") {
+                console.info(`p2p connection disconnected: ${safePeerId}`);
             }
         };
 
@@ -1565,8 +1614,24 @@ async function ensureOfferForPeer(state, roomContext = {}) {
         return;
     }
 
-    if (state.isNegotiating || state.pc.signalingState !== "stable") {
+    if (state.isNegotiating) {
         return;
+    }
+
+    if (state.pc.signalingState !== "stable") {
+        const offerAgeMs = Date.now() - Number(state.lastOfferSentAtMs || 0);
+        const canRollbackStaleOffer = state.pc.signalingState === "have-local-offer" && offerAgeMs > 8000;
+
+        if (canRollbackStaleOffer) {
+            try {
+                await state.pc.setLocalDescription({ type: "rollback" });
+            } catch (error) {
+                console.warn("rollback stale offer failed", error);
+                return;
+            }
+        } else {
+            return;
+        }
     }
 
     state.isNegotiating = true;
@@ -1586,6 +1651,7 @@ async function ensureOfferForPeer(state, roomContext = {}) {
             roomContext.roomId || "",
             roomContext.roomName || ""
         );
+        state.lastOfferSentAtMs = Date.now();
     } finally {
         state.isNegotiating = false;
     }
@@ -1661,6 +1727,15 @@ async function sendSignalCandidate(toPeerId, candidate, roomId, sdpMid, sdpMLine
         room_id: roomId || "",
         sdp_mid: sdpMid,
         sdp_mline_index: sdpMLineIndex
+    });
+}
+
+async function sendSignalRoom(toPeerId, roomId, roomName, peers) {
+    return postSignal("/api/signal/room", {
+        to_peer_id: toPeerId,
+        room_id: roomId || "",
+        room_name: roomName || "",
+        peers: Array.isArray(peers) ? peers : []
     });
 }
 
@@ -1763,6 +1838,16 @@ async function handleSignalCandidate(event) {
 async function processSignalEvent(event) {
     const type = normalizeText(event.type).toLowerCase();
 
+    if (type === "channel-created") {
+        await handleChannelCreatedSignal(event);
+        return;
+    }
+
+    if (type === "p2p-room") {
+        await handleP2PRoomSignal(event);
+        return;
+    }
+
     if (type === "offer") {
         await handleSignalOffer(event);
         return;
@@ -1781,6 +1866,82 @@ async function processSignalEvent(event) {
     if (type === "candidate") {
         await handleSignalCandidate(event);
     }
+}
+
+async function handleChannelCreatedSignal(event) {
+    const payload = event && typeof event === "object" ? event.payload : null;
+    const channel = normalizeText(payload && payload.channel);
+    if (!channel) {
+        return;
+    }
+
+    if (!knownChannels.includes(channel)) {
+        try {
+            await apiJson("/api/join-channel", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ channel })
+            });
+        } catch (error) {
+            console.error("auto-join on channel-created failed", error);
+        }
+    }
+
+    await refreshSidebarData();
+}
+
+async function handleP2PRoomSignal(event) {
+    const fromPeerId = normalizePeerId(event && event.from_peer_id);
+    if (!fromPeerId) {
+        return;
+    }
+
+    const payload = event && typeof event === "object" ? event.payload : null;
+    const roomId = normalizeText(payload && payload.room_id);
+    const roomName = normalizeText(payload && payload.room_name);
+    const peers = Array.isArray(payload && payload.peers) ? payload.peers : [fromPeerId];
+
+    const room = ensureRoomFromIncoming(fromPeerId, {
+        room_id: roomId,
+        room_name: roomName,
+        peers
+    });
+
+    if (!room) {
+        return;
+    }
+
+    syncRoomPeerBindings(room);
+
+    const state = ensurePeerConnection(fromPeerId, {
+        roomId: room.room_id,
+        roomName: room.room_name
+    });
+    if (!state) {
+        return;
+    }
+
+    window.setTimeout(() => {
+        if (peerConnections.get(fromPeerId) !== state) {
+            return;
+        }
+
+        if (state.channel && state.channel.readyState === "open") {
+            return;
+        }
+
+        const hasRemoteDescription = Boolean(state.pc.remoteDescription && state.pc.remoteDescription.type);
+        if (hasRemoteDescription) {
+            return;
+        }
+
+        ensureOfferForPeer(state, {
+            roomId: room.room_id,
+            roomName: room.room_name
+        }).catch((error) => {
+            console.error("fallback room-offer failed", error);
+        });
+    }, 1200);
 }
 
 async function handleChannelUpdateSignal(event) {
@@ -2178,7 +2339,15 @@ async function createP2PRoomFromComposer() {
 
     syncRoomPeerBindings(room);
 
+    let failedOffers = 0;
+
     for (const peerId of room.peers) {
+        try {
+            await sendSignalRoom(peerId, room.room_id, room.room_name, room.peers);
+        } catch (error) {
+            console.error("send room signal failed", error);
+        }
+
         const state = ensurePeerConnection(peerId, {
             roomId: room.room_id,
             roomName: room.room_name,
@@ -2186,11 +2355,22 @@ async function createP2PRoomFromComposer() {
         });
 
         if (state) {
-            await ensureOfferForPeer(state, {
-                roomId: room.room_id,
-                roomName: room.room_name
-            });
+            try {
+                await ensureOfferForPeer(state, {
+                    roomId: room.room_id,
+                    roomName: room.room_name
+                });
+            } catch (error) {
+                failedOffers += 1;
+                console.error("initial room offer failed", error);
+            }
+        } else {
+            failedOffers += 1;
         }
+    }
+
+    if (failedOffers > 0) {
+        showToast("Room created. Retrying peer connection in background.", true);
     }
 
     await refreshCurrentMessages();

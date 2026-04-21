@@ -297,6 +297,34 @@ def _queue_channel_update_signals(channel_name, from_user, from_peer_id, seq):
     return notified
 
 
+def _queue_channel_created_signals(channel_name, from_user, from_peer_id):
+    """Notify online peers that a new channel was created."""
+    safe_channel = str(channel_name or "").strip()
+    safe_from_peer = _normalize_peer_id(from_peer_id)
+    if not safe_channel:
+        return 0
+
+    online_peer_ids = _collect_online_peer_ids()
+    if not online_peer_ids:
+        return 0
+
+    notified = 0
+    for target_peer_id in online_peer_ids:
+        if not target_peer_id or target_peer_id == safe_from_peer:
+            continue
+
+        _queue_signal_event(
+            "channel-created",
+            from_user,
+            safe_from_peer,
+            target_peer_id,
+            {"channel": safe_channel},
+        )
+        notified += 1
+
+    return notified
+
+
 def _sanitize_signal_event(event):
     """Return API-safe signaling event representation."""
     return {
@@ -368,7 +396,7 @@ def handle_get_user_channels(headers, body):
 
 def handle_create_channel(headers, body):
     """Handle POST /api/create-channel."""
-    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
     if unauthorized:
         return unauthorized
 
@@ -381,11 +409,16 @@ def handle_create_channel(headers, body):
     if info == "invalid-channel":
         return _json(build_error("invalid-channel", "Channel name is required"))
 
+    created_signal_count = 0
+    if created:
+        created_signal_count = _queue_channel_created_signals(info, auth_user, auth_peer_id)
+
     return _json(
         {
             "status": "created" if created else "exists",
             "channel": info,
             "user": auth_user,
+            "created_signal_count": created_signal_count,
         }
     )
 
@@ -412,7 +445,7 @@ def handle_join_channel(headers, body):
 
 def handle_join_or_create_channel(headers, body):
     """Handle POST /api/channel-upsert as merged join/create behavior."""
-    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
     if unauthorized:
         return unauthorized
 
@@ -432,11 +465,16 @@ def handle_join_or_create_channel(headers, body):
         return _json(build_error("invalid-channel", "Channel name is required"))
 
     created, created_channel = create_channel(channel, auth_user)
+    created_signal_count = 0
+    if created:
+        created_signal_count = _queue_channel_created_signals(created_channel, auth_user, auth_peer_id)
+
     return _json(
         {
             "status": "created" if created else "joined",
             "channel": created_channel,
             "user": auth_user,
+            "created_signal_count": created_signal_count,
         }
     )
 
@@ -801,6 +839,46 @@ def handle_signal_candidate(headers, body):
         auth_peer_id,
         to_peer_id,
         payload,
+    )
+
+    return _json({"status": "queued", "event_id": event_id, "to_peer_id": to_peer_id})
+
+
+def handle_signal_room(headers, body):
+    """Handle POST /api/signal/room to notify peer-side P2P room creation."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
+
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    to_peer_id, target_error = _read_signal_target(data, auth_peer_id)
+    if target_error:
+        return target_error
+
+    room_id = str(data.get("room_id", "")).strip()
+    if not room_id:
+        return _json(build_error("missing-fields", "room_id is required"))
+
+    room_name = str(data.get("room_name", "")).strip()
+    peers = [
+        _normalize_peer_id(peer_id)
+        for peer_id in (data.get("peers") if isinstance(data.get("peers"), list) else [])
+        if _normalize_peer_id(peer_id)
+    ]
+
+    event_id = _queue_signal_event(
+        "p2p-room",
+        auth_user,
+        auth_peer_id,
+        to_peer_id,
+        {
+            "room_id": room_id,
+            "room_name": room_name,
+            "peers": peers,
+        },
     )
 
     return _json({"status": "queued", "event_id": event_id, "to_peer_id": to_peer_id})
