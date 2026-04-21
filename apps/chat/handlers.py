@@ -234,19 +234,22 @@ def _queue_signal_event(signal_type, from_user, from_peer_id, to_peer_id, payloa
     with _signal_condition:
         _cleanup_signal_queues_locked(now_ts)
         _signal_event_counter += 1
+        # Normalize peer ids to ensure consistent queue keys and lookups
+        safe_to_peer = _normalize_peer_id(to_peer_id)
+        safe_from_peer = _normalize_peer_id(from_peer_id)
 
         event = {
             "event_id": _signal_event_counter,
             "type": signal_type,
             "from_user": str(from_user or ""),
-            "from_peer_id": str(from_peer_id or ""),
-            "to_peer_id": str(to_peer_id or ""),
+            "from_peer_id": safe_from_peer,
+            "to_peer_id": safe_to_peer,
             "payload": payload or {},
             "timestamp": _now_iso(),
             "created_at_ts": now_ts,
         }
 
-        queue = _signal_queues.setdefault(str(to_peer_id), [])
+        queue = _signal_queues.setdefault(safe_to_peer, [])
         queue.append(event)
         if len(queue) > MAX_SIGNAL_EVENTS_PER_PEER:
             del queue[:-MAX_SIGNAL_EVENTS_PER_PEER]
@@ -331,8 +334,8 @@ def _sanitize_signal_event(event):
         "event_id": int(event.get("event_id", 0)),
         "type": str(event.get("type", "")),
         "from_user": str(event.get("from_user", "")),
-        "from_peer_id": str(event.get("from_peer_id", "")),
-        "to_peer_id": str(event.get("to_peer_id", "")),
+        "from_peer_id": _normalize_peer_id(event.get("from_peer_id", "")),
+        "to_peer_id": _normalize_peer_id(event.get("to_peer_id", "")),
         "payload": event.get("payload", {}),
         "timestamp": str(event.get("timestamp", "")),
     }
@@ -895,6 +898,7 @@ def handle_signal_poll(headers, body):
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     claimed_peer = str(data.get("peer_id", "")).strip()
+    claimed_peer = _normalize_peer_id(claimed_peer)
     if claimed_peer and claimed_peer != auth_peer_id:
         return _json(build_error("forbidden", "Peer identity spoofing attempt"))
 
