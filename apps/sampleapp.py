@@ -24,30 +24,22 @@ from urllib.parse import parse_qs
 
 from daemon import AsynapRous
 from .auth.account_store import create_account
-from .tracker.handlers import handle_add_list, handle_get_list, handle_submit_info
 from .chat.handlers import (
-    handle_broadcast_peer,
-    handle_create_p2p_room,
-    handle_connect_peer,
+    handle_channel_long_poll,
     handle_create_channel,
     handle_get_channel_msgs,
-    handle_get_or_create_direct_room,
     handle_get_channels,
     handle_get_online_peers,
-    handle_get_p2p_messages,
     handle_get_user_channels,
     handle_join_or_create_channel,
     handle_join_channel,
     handle_leave_channel,
-    handle_leave_p2p_room,
-    handle_list_p2p_rooms,
     handle_rename_channel,
-    handle_rename_p2p_room,
-    handle_receive_channel_msg,
-    handle_receive_msg,
     handle_send_channel_msg,
-    handle_send_p2p_room_message,
-    handle_send_peer,
+    handle_signal_answer,
+    handle_signal_candidate,
+    handle_signal_offer,
+    handle_signal_poll,
 )
 
 app = AsynapRous()
@@ -151,37 +143,6 @@ async def hello(headers, body):
 
     return json.dumps(data)
 
-# from tracker/handlers.py
-@app.route("/submit-info", methods=["POST"])
-def submit_info(headers, body):
-    return handle_submit_info(headers, body)
-
-
-@app.route("/add-list", methods=["POST"])
-def add_list(headers, body):
-    return handle_add_list(headers, body)
-
-@app.route("/get-list", methods=["GET"])
-def get_list(headers, body):
-    return handle_get_list(headers, body)
-
-# from chat/handlers.py
-@app.route("/send-peer", methods=["POST"])
-def send_peer(headers, body):
-    return handle_send_peer(headers, body)
-
-@app.route("/broadcast-peer", methods=["POST"])
-def broadcast_peer(headers, body):
-    return handle_broadcast_peer(headers, body)
-
-@app.route("/connect-peer", methods=["POST"])
-def connect_peer(headers, body):
-    return handle_connect_peer(headers, body)
-
-@app.route("/receive-msg", methods=["POST"])
-def receive_msg(headers, body):
-    return handle_receive_msg(headers, body)
-
 @app.route("/api/channels", methods=["GET"])
 def api_channels(headers, body):
     return handle_get_channels(headers, body)
@@ -224,9 +185,9 @@ def api_get_messages(headers, body):
 def api_send_channel(headers, body):
     return handle_send_channel_msg(headers, body)
 
-@app.route("/api/receive-channel", methods=["POST"])
-def api_receive_channel(headers, body):
-    return handle_receive_channel_msg(headers, body)
+@app.route("/api/channel/long-poll", methods=["POST"])
+def api_channel_long_poll(headers, body):
+    return handle_channel_long_poll(headers, body)
 
 
 @app.route("/api/online-peers", methods=["GET"])
@@ -234,39 +195,24 @@ def api_online_peers(headers, body):
     return handle_get_online_peers(headers, body)
 
 
-@app.route("/api/p2p/rooms", methods=["POST"])
-def api_p2p_rooms(headers, body):
-    return handle_list_p2p_rooms(headers, body)
+@app.route("/api/signal/offer", methods=["POST"])
+def api_signal_offer(headers, body):
+    return handle_signal_offer(headers, body)
 
 
-@app.route("/api/p2p/create-room", methods=["POST"])
-def api_p2p_create_room(headers, body):
-    return handle_create_p2p_room(headers, body)
+@app.route("/api/signal/answer", methods=["POST"])
+def api_signal_answer(headers, body):
+    return handle_signal_answer(headers, body)
 
 
-@app.route("/api/p2p/direct-room", methods=["POST"])
-def api_p2p_direct_room(headers, body):
-    return handle_get_or_create_direct_room(headers, body)
+@app.route("/api/signal/candidate", methods=["POST"])
+def api_signal_candidate(headers, body):
+    return handle_signal_candidate(headers, body)
 
 
-@app.route("/api/p2p/messages", methods=["POST"])
-def api_p2p_messages(headers, body):
-    return handle_get_p2p_messages(headers, body)
-
-
-@app.route("/api/p2p/send-room", methods=["POST"])
-def api_p2p_send_room(headers, body):
-    return handle_send_p2p_room_message(headers, body)
-
-
-@app.route("/api/p2p/rename", methods=["POST"])
-def api_p2p_rename(headers, body):
-    return handle_rename_p2p_room(headers, body)
-
-
-@app.route("/api/p2p/leave", methods=["POST"])
-def api_p2p_leave(headers, body):
-    return handle_leave_p2p_room(headers, body)
+@app.route("/api/signal/poll", methods=["POST"])
+def api_signal_poll(headers, body):
+    return handle_signal_poll(headers, body)
 
 def create_sampleapp(ip, port):
     # Prepare and launch the RESTful application

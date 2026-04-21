@@ -157,8 +157,6 @@ class HttpAdapter:
             "/register.html",
             "/form.html",
             "/echo",
-            "/receive-msg",
-            "/api/receive-channel",
             "/favicon.ico",
         }:
             return True
@@ -168,18 +166,12 @@ class HttpAdapter:
         )
 
     def _is_protected_path(self, path):
-        """Return True for endpoints requiring valid session or valid auth header."""
+        """Return True for endpoints requiring a valid authenticated session."""
         if self._is_public_path(path):
             return False
 
         if path in {
             "/chat.html",
-            "/submit-info",
-            "/add-list",
-            "/get-list",
-            "/connect-peer",
-            "/broadcast-peer",
-            "/send-peer",
             "/hello",
             "/logout",
         }:
@@ -306,15 +298,9 @@ class HttpAdapter:
         return req.hook(**kwargs)
 
     def _credentials_from_request(self, req):
-        """Extract credentials from body first, then fallback to Authorization."""
+        """Extract credentials from request body payload."""
         body_creds = req.extract_credentials_from_body()
-        if body_creds:
-            return body_creds
-
-        if isinstance(req.auth, tuple) and len(req.auth) == 2:
-            return req.auth
-
-        return None
+        return body_creds
 
     def _attach_authenticated_user(self, req, username):
         """Attach authenticated user to request headers for route handlers."""
@@ -324,25 +310,12 @@ class HttpAdapter:
         req.headers["X-Authenticated-User"] = str(username)
 
     def _authenticate_request(self, req):
-        """Validate session cookie or basic credentials for protected endpoints."""
+        """Validate session cookie for protected endpoints."""
         _cookie_name, session_id = self._read_session_cookie(req)
         user_from_session = get_session_user(session_id)
         if user_from_session:
             self._attach_authenticated_user(req, user_from_session)
             return user_from_session
-
-        if isinstance(req.auth, tuple) and check_credentials(req.auth):
-            if not self._connection_uses_tls():
-                warn = os.environ.get("ASYNAPROUS_WARN_INSECURE_AUTH", "1").strip().lower()
-                if warn not in {"0", "false", "no", "off"}:
-                    print(
-                        "[Security] Basic auth accepted on non-TLS connection; credentials can be intercepted"
-                    )
-            username = req.auth[0]
-            session_id = create_session(username)
-            self._set_session_cookie(req, session_id, SESSION_TTL_SECONDS)
-            self._attach_authenticated_user(req, username)
-            return username
 
         return None
 
@@ -352,7 +325,6 @@ class HttpAdapter:
         if not credentials or not check_credentials(credentials):
             self.response.status_code = 401
             self.response.reason = self.response._status_reason(401)
-            self.response.headers.pop("WWW-Authenticate", None)
             self.response.headers["Cache-Control"] = "no-store"
             return self.response.build_response(
                 req,
@@ -411,8 +383,6 @@ class HttpAdapter:
                 conn.sendall(response)
                 return
 
-            req.prepare_auth(req.headers.get("Authorization"))
-
             if req.path == "/login" and req.method == "POST":
                 response = self._handle_login(req)
                 conn.sendall(response)
@@ -467,8 +437,6 @@ class HttpAdapter:
                 writer.close()
                 await writer.wait_closed()
                 return
-
-            req.prepare_auth(req.headers.get("Authorization"))
 
             if req.path == "/login" and req.method == "POST":
                 writer.write(self._handle_login(req))

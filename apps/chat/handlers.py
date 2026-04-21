@@ -1,11 +1,9 @@
-"""Chat handlers for peer messaging and channel operations."""
+"""Chat handlers for channel APIs, peer discovery, and WebRTC signaling."""
 
+import datetime
 import json
-import socket
 import threading
-import ssl
-import os
-import ipaddress
+import time
 
 from .channel_service import (
     add_message,
@@ -18,33 +16,39 @@ from .channel_service import (
     join_channel,
     rename_channel,
 )
-from .peer_service import add_peer_info, get_all_peers, get_peer_info
-from .p2p_store import (
-    add_room_message,
-    create_private_room,
-    get_direct_room_owners,
-    get_or_create_direct_room,
-    get_room,
-    get_room_messages,
-    leave_room,
-    list_rooms,
-    rename_room,
-    to_shared_private_room_id,
-    upsert_room_for_owner,
-)
-from apps.tracker.registry import (
-    get_all_peers as get_tracker_peers,
-    register_peer as register_tracker_peer,
-)
 from apps.auth.account_store import get_peer_id_for_user, get_username_for_peer_id
-from .protocol import (
-    COMMAND_BROADCAST_PEER,
-    COMMAND_CHANNEL_MESSAGE,
-    COMMAND_SEND_PEER,
-    build_envelope,
-    build_error,
-    validate_envelope,
-)
+from .protocol import build_error
+
+
+PRESENCE_TTL_SECONDS = 90
+
+MIN_CHANNEL_LONG_POLL_SECONDS = 5
+MAX_CHANNEL_LONG_POLL_SECONDS = 30
+DEFAULT_CHANNEL_LONG_POLL_SECONDS = 25
+
+MIN_SIGNAL_POLL_SECONDS = 5
+MAX_SIGNAL_POLL_SECONDS = 30
+DEFAULT_SIGNAL_POLL_SECONDS = 25
+
+SIGNAL_EVENT_TTL_SECONDS = 180
+MAX_SIGNAL_EVENTS_PER_PEER = 400
+
+
+_presence_lock = threading.Lock()
+_peer_presence = {}
+
+_signal_lock = threading.Lock()
+_signal_condition = threading.Condition(_signal_lock)
+_signal_queues = {}
+_signal_event_counter = 0
+
+_channel_lock = threading.Lock()
+_channel_condition = threading.Condition(_channel_lock)
+_channel_versions = {}
+
+
+def _now_iso():
+    return datetime.datetime.utcnow().isoformat() + "Z"
 
 
 def _json(payload):
@@ -60,6 +64,20 @@ def _parse_json(body):
         return None
 
 
+def _safe_int(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+
+    return parsed
+
+
 def _authenticated_user(headers):
     """Read authenticated username propagated by HTTP adapter."""
     if not headers:
@@ -67,422 +85,271 @@ def _authenticated_user(headers):
     return str(headers.get("X-Authenticated-User", "")).strip()
 
 
-def _parse_host_ip_port(headers):
-    """Extract reachable host and port from Host header."""
-    if not headers:
-        return "", 0
+def _authenticated_peer(headers):
+    """Resolve authenticated user and stable peer identifier."""
+    username = _authenticated_user(headers)
+    if not username:
+        return "", ""
 
-    raw_host = str(headers.get("Host", "") or "").strip()
-    if not raw_host:
-        return "", 0
-
-    host = raw_host.split(",", 1)[0].strip()
-    if not host:
-        return "", 0
-
-    host_ip = ""
-    host_port = 0
-
-    if host.startswith("["):
-        end = host.find("]")
-        if end < 0:
-            return "", 0
-        host_ip = host[1:end].strip()
-        tail = host[end + 1 :].strip()
-        if not tail.startswith(":"):
-            return "", 0
-        port_text = tail[1:].strip()
-    else:
-        if ":" not in host:
-            return "", 0
-        host_ip, port_text = host.rsplit(":", 1)
-        host_ip = host_ip.strip()
-
-    try:
-        host_port = int(port_text)
-    except (TypeError, ValueError):
-        return "", 0
-
-    if host_port <= 0 or host_port > 65535:
-        return "", 0
-
-    if host_ip in {"localhost", "0.0.0.0", "::", "[::]", ""}:
-        host_ip = "127.0.0.1"
-
-    try:
-        ipaddress.ip_address(host_ip)
-    except ValueError:
-        if host_ip == "localhost":
-            host_ip = "127.0.0.1"
-
-    return host_ip, host_port
+    peer_id = get_peer_id_for_user(username)
+    return username, str(peer_id or "").strip()
 
 
-def _authenticated_peer_id(headers):
-    """Resolve current user's stable peer id."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return ""
-    return get_peer_id_for_user(auth_user)
+def _touch_presence(username, peer_id):
+    """Update in-memory presence for one authenticated peer."""
+    safe_user = str(username or "").strip()
+    safe_peer = str(peer_id or "").strip()
+    if not safe_user or not safe_peer:
+        return
+
+    with _presence_lock:
+        _peer_presence[safe_peer] = {
+            "user_id": safe_user,
+            "last_seen": time.time(),
+        }
 
 
-def _register_authenticated_peer(headers):
-    """Upsert authenticated user's local endpoint into peer directory."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return ""
+def _collect_online_peers(exclude_peer_id=""):
+    """Return online peers observed recently via authenticated requests."""
+    safe_exclude = str(exclude_peer_id or "").strip()
+    now = time.time()
+    peers = []
 
-    peer_id = get_peer_id_for_user(auth_user)
-    if not peer_id:
-        return ""
+    with _presence_lock:
+        stale_peers = []
+        for peer_id, info in _peer_presence.items():
+            age = now - float(info.get("last_seen", 0.0))
+            if age > PRESENCE_TTL_SECONDS:
+                stale_peers.append(peer_id)
+                continue
 
-    host_ip, host_port = _parse_host_ip_port(headers)
-    if host_ip and host_port:
-        add_peer_info(peer_id, host_ip, host_port, owner_username=auth_user)
-        register_tracker_peer(peer_id, host_ip, host_port)
+            if peer_id == safe_exclude:
+                continue
 
-    return peer_id
-
-
-def _default_private_room_name(peers):
-    """Build a readable fallback name when room_name is omitted."""
-    if not isinstance(peers, list) or not peers:
-        return "Private Conversation"
-
-    cleaned = [str(peer or "").strip() for peer in peers if str(peer or "").strip()]
-    if not cleaned:
-        return "Private Conversation"
-
-    if len(cleaned) <= 2:
-        return "P2P: {}".format(", ".join(cleaned))
-
-    return "P2P: {}, {} +{}".format(cleaned[0], cleaned[1], len(cleaned) - 2)
-
-
-def _send_http_post(target_ip, target_port, payload, endpoint="/receive-msg", timeout=5):
-    """Send an HTTP POST request to target peer and return delivery result."""
-    sock = None
-    try:
-        body = json.dumps(payload)
-        request = (
-            "POST {} HTTP/1.1\r\n"
-            "Host: {}:{}\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: {}\r\n"
-            "Connection: close\r\n\r\n"
-            "{}"
-        ).format(endpoint, target_ip, target_port, len(body.encode("utf-8")), body)
-
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.settimeout(timeout)
-
-        peer_tls = os.environ.get("ASYNAPROUS_PEER_TLS", "0").strip().lower()
-        use_tls = peer_tls in {"1", "true", "yes", "on"}
-
-        sock = raw_sock
-        if use_tls:
-            verify = os.environ.get("ASYNAPROUS_PEER_TLS_VERIFY", "0").strip().lower()
-            verify_cert = verify in {"1", "true", "yes", "on"}
-
-            context = ssl.create_default_context()
-            if verify_cert:
-                ca_file = os.environ.get("ASYNAPROUS_PEER_TLS_CA_FILE", "").strip()
-                if ca_file:
-                    context.load_verify_locations(cafile=ca_file)
-            else:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-
-            sock = context.wrap_socket(
-                raw_sock,
-                server_hostname=target_ip if verify_cert else None,
+            user_id = str(info.get("user_id", "")).strip() or get_username_for_peer_id(peer_id)
+            peers.append(
+                {
+                    "peer_id": str(peer_id),
+                    "user_id": user_id or str(peer_id),
+                    "online": True,
+                }
             )
 
-        sock.connect((target_ip, int(target_port)))
-        sock.sendall(request.encode("utf-8"))
+        for peer_id in stale_peers:
+            _peer_presence.pop(peer_id, None)
 
-        # Drain response so the peer completes write path cleanly.
-        while True:
-            chunk = sock.recv(1024)
-            if not chunk:
-                break
-
-        return True
-    except Exception as exc:
-        print("[P2P Error] {}".format(exc))
-        return False
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+    peers.sort(key=lambda item: (item["user_id"], item["peer_id"]))
+    return peers
 
 
-def _extract_peer_payload(data):
-    """Extract sender/message/channel from either envelope or legacy payload."""
-    if validate_envelope(data):
-        payload = data.get("payload", {})
-        sender = data.get("sender", "peer")
-        message = payload.get("message") or payload.get("msg", "")
-        channel = payload.get("channel", "general")
-        return sender, message, channel
+def _channel_version(channel_name):
+    safe_channel = str(channel_name or "").strip()
+    if not safe_channel:
+        return 0
 
-    sender = data.get("from") or data.get("sender", "peer")
-    message = data.get("msg") or data.get("message", "")
-    channel = data.get("channel", "general")
-    return sender, message, channel
+    with _channel_lock:
+        return int(_channel_versions.get(safe_channel, 0))
 
 
-def handle_connect_peer(headers, body):
-    """Handle /connect-peer for storing remote peer endpoint."""
-    _ = headers
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
+def _bump_channel_version(channel_name):
+    """Increase one channel's in-memory version and wake long-poll waiters."""
+    safe_channel = str(channel_name or "").strip()
+    if not safe_channel:
+        return 0
 
-    peer_id = data.get("peer_id")
-    ip = data.get("ip")
-    port = data.get("port")
-
-    if not peer_id or not ip or port is None:
-        return _json(build_error("missing-fields", "Missing peer_id, ip, or port"))
-
-    if add_peer_info(peer_id, ip, port):
-        return _json({"status": "connected", "peer": peer_id})
-
-    return _json(build_error("invalid-peer", "Invalid peer endpoint"))
+    with _channel_condition:
+        current = int(_channel_versions.get(safe_channel, 0)) + 1
+        _channel_versions[safe_channel] = current
+        _channel_condition.notify_all()
+        return current
 
 
-def handle_send_peer(headers, body):
-    """Handle /send-peer direct peer-to-peer message delivery."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
-
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    peer_id = data.get("to_peer")
-    message = str(data.get("message", "")).strip()
-    sender_peer_id = _authenticated_peer_id(headers) or auth_user
-
-    if not peer_id or not message:
-        return _json(build_error("missing-fields", "Missing to_peer or message"))
-
-    info = get_peer_info(peer_id)
-    if not info:
-        return _json(build_error("peer-not-found", "Peer not found"))
-
-    room = get_or_create_direct_room(auth_user, str(peer_id))
-    if not room:
-        return _json(build_error("invalid-room", "Unable to create direct room"))
-
-    recipient_user = str(info.get("owner_username", "") or "").strip() or str(
-        data.get("recipient_user", "shared") or "shared"
-    )
-
-    envelope = build_envelope(
-        COMMAND_SEND_PEER,
-        payload={
-            "message": message,
-            "to_peer": str(peer_id),
-            "recipient_user": recipient_user,
-            "room_name": room["room_name"],
-        },
-        sender=str(sender_peer_id),
-    )
-
-    stored = add_room_message(
-        auth_user,
-        room["room_id"],
-        str(peer_id),
-        auth_user,
-        message,
-        "sent",
-    )
-
-    success = _send_http_post(info["ip"], info["port"], envelope, endpoint="/receive-msg")
-    if success:
-        return _json({"status": "sent", "room": room, "message": stored})
-
-    return _json(build_error("peer-unreachable", "Peer unreachable"))
-
-
-def handle_broadcast_peer(headers, body):
-    """Handle /broadcast-peer for fan-out to all connected peers."""
-    auth_user = _authenticated_user(headers)
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    message = str(data.get("message", "")).strip()
-    sender = auth_user or data.get("sender", "me")
-    if not message:
-        return _json(build_error("missing-message", "Missing message"))
-
-    peers = get_all_peers()
-    delivered = 0
-
-    envelope = build_envelope(
-        COMMAND_BROADCAST_PEER,
-        payload={"message": message},
-        sender=str(sender),
-    )
-
-    for info in peers.values():
-        if _send_http_post(info["ip"], info["port"], envelope, endpoint="/receive-msg"):
-            delivered += 1
-
-    return _json({"status": "broadcast_done", "delivered": delivered})
-
-
-def handle_receive_msg(headers, body):
-    """Handle /receive-msg callback endpoint for direct peer messages."""
-    _ = headers
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    sender, message, _ = _extract_peer_payload(data)
-    message = str(message).strip()
-    if not message:
-        return _json(build_error("empty-message", "Message is empty"))
-
-    payload = data.get("payload", {}) if isinstance(data, dict) else {}
-    sender_peer_id = str(sender or "").strip() or "peer"
-    room_id = str(payload.get("room_id", "") or "").strip()
-    room_name = str(payload.get("room_name", "") or "").strip()
-
-    room_peers_raw = payload.get("peers", [])
-    room_peers = []
-    if isinstance(room_peers_raw, list):
-        seen_peers = set()
-        for peer in room_peers_raw:
-            safe_peer = str(peer or "").strip()
-            if not safe_peer or safe_peer in seen_peers:
-                continue
-            seen_peers.add(safe_peer)
-            room_peers.append(safe_peer)
-
-    use_shared_room = room_id.startswith("private::") and bool(room_peers)
-
-    target_owners = set(get_direct_room_owners(sender))
-    recipient_user = str(payload.get("recipient_user", "") or "").strip()
-    if recipient_user:
-        target_owners.add(recipient_user)
-
-    if not target_owners:
-        target_owners.add("shared")
-
-    for owner_username in target_owners:
-        if use_shared_room:
-            owner_peer_id = get_peer_id_for_user(owner_username)
-            normalized_peers = []
-            seen_peers = set()
-
-            # Build owner-local peer list: include sender, exclude owner itself.
-            for peer in room_peers + [sender_peer_id]:
-                safe_peer = str(peer or "").strip()
-                if not safe_peer or safe_peer == owner_peer_id or safe_peer in seen_peers:
-                    continue
-                seen_peers.add(safe_peer)
-                normalized_peers.append(safe_peer)
-
-            room = upsert_room_for_owner(owner_username, room_id, room_name, normalized_peers)
-        else:
-            room = get_or_create_direct_room(owner_username, sender_peer_id)
-
-        if not room:
+def _cleanup_signal_queues_locked(now_ts):
+    """Drop stale signaling events and trim queue sizes."""
+    for target_peer_id in list(_signal_queues.keys()):
+        queue = _signal_queues.get(target_peer_id, [])
+        if not queue:
+            _signal_queues.pop(target_peer_id, None)
             continue
 
-        add_room_message(
-            owner_username,
-            room["room_id"],
-            sender_peer_id,
-            sender_peer_id,
-            message,
-            "received",
-        )
+        filtered = [
+            event
+            for event in queue
+            if now_ts - float(event.get("created_at_ts", 0.0)) <= SIGNAL_EVENT_TTL_SECONDS
+        ]
 
-    print("\n[NEW MESSAGE] from {}: {}\n".format(sender, message))
-    return _json({"status": "received"})
+        if len(filtered) > MAX_SIGNAL_EVENTS_PER_PEER:
+            filtered = filtered[-MAX_SIGNAL_EVENTS_PER_PEER:]
+
+        if filtered:
+            _signal_queues[target_peer_id] = filtered
+        else:
+            _signal_queues.pop(target_peer_id, None)
+
+
+def _collect_pending_events_locked(target_peer_id, last_event_id):
+    """Return pending events for target and prune already-acknowledged records."""
+    queue = _signal_queues.get(target_peer_id, [])
+    if not queue:
+        return []
+
+    pending = [event for event in queue if int(event.get("event_id", 0)) > last_event_id]
+    if pending:
+        _signal_queues[target_peer_id] = pending
+    else:
+        _signal_queues.pop(target_peer_id, None)
+
+    return list(pending)
+
+
+def _queue_signal_event(signal_type, from_user, from_peer_id, to_peer_id, payload):
+    """Append one signaling event to the receiver queue."""
+    global _signal_event_counter
+
+    now_ts = time.time()
+    with _signal_condition:
+        _cleanup_signal_queues_locked(now_ts)
+        _signal_event_counter += 1
+
+        event = {
+            "event_id": _signal_event_counter,
+            "type": signal_type,
+            "from_user": str(from_user or ""),
+            "from_peer_id": str(from_peer_id or ""),
+            "to_peer_id": str(to_peer_id or ""),
+            "payload": payload or {},
+            "timestamp": _now_iso(),
+            "created_at_ts": now_ts,
+        }
+
+        queue = _signal_queues.setdefault(str(to_peer_id), [])
+        queue.append(event)
+        if len(queue) > MAX_SIGNAL_EVENTS_PER_PEER:
+            del queue[:-MAX_SIGNAL_EVENTS_PER_PEER]
+
+        _signal_condition.notify_all()
+
+    return event["event_id"]
+
+
+def _sanitize_signal_event(event):
+    """Return API-safe signaling event representation."""
+    return {
+        "event_id": int(event.get("event_id", 0)),
+        "type": str(event.get("type", "")),
+        "from_user": str(event.get("from_user", "")),
+        "from_peer_id": str(event.get("from_peer_id", "")),
+        "to_peer_id": str(event.get("to_peer_id", "")),
+        "payload": event.get("payload", {}),
+        "timestamp": str(event.get("timestamp", "")),
+    }
+
+
+def _require_authenticated_peer(headers):
+    """Return authenticated identity tuple or unauthorized payload."""
+    auth_user, auth_peer_id = _authenticated_peer(headers)
+    if not auth_user or not auth_peer_id:
+        return "", "", _json(build_error("unauthorized", "Unauthorized"))
+
+    _touch_presence(auth_user, auth_peer_id)
+    return auth_user, auth_peer_id, ""
+
+
+def _read_signal_target(data, sender_peer_id):
+    """Validate destination peer and sender claim for signaling payloads."""
+    if not isinstance(data, dict):
+        return "", _json(build_error("invalid-json", "Invalid JSON"))
+
+    claimed_from = str(data.get("from_peer_id", "")).strip()
+    if claimed_from and claimed_from != sender_peer_id:
+        return "", _json(build_error("forbidden", "Peer identity spoofing attempt"))
+
+    to_peer_id = str(data.get("to_peer_id", data.get("to_peer", ""))).strip()
+    if not to_peer_id:
+        return "", _json(build_error("missing-fields", "to_peer_id is required"))
+
+    if to_peer_id == sender_peer_id:
+        return "", _json(build_error("invalid-peer", "Cannot signal yourself"))
+
+    target_username = get_username_for_peer_id(to_peer_id)
+    if not target_username:
+        return "", _json(build_error("peer-not-found", "Peer not found"))
+
+    return to_peer_id, ""
 
 
 def handle_get_channels(headers, body):
     """Handle GET /api/channels."""
-    _ = headers
     _ = body
+    auth_user = _authenticated_user(headers)
+    if not auth_user:
+        return _json(build_error("unauthorized", "Unauthorized"))
+
+    _touch_presence(auth_user, get_peer_id_for_user(auth_user))
     return _json(get_channels())
 
 
 def handle_get_user_channels(headers, body):
     """Handle POST /api/my-channels."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    _ = body
 
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
+    auth_user, peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
-    peer_id = _register_authenticated_peer(headers)
     channels = get_user_channels(auth_user)
     return _json({"status": "ok", "user": auth_user, "peer_id": peer_id, "channels": channels})
 
 
 def handle_create_channel(headers, body):
     """Handle POST /api/create-channel."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     channel = str(data.get("channel", "")).strip()
-    user = auth_user
-
-    created, info = create_channel(channel, user)
+    created, info = create_channel(channel, auth_user)
     if info == "invalid-channel":
         return _json(build_error("invalid-channel", "Channel name is required"))
 
-    return _json({
-        "status": "created" if created else "exists",
-        "channel": info,
-        "user": user,
-    })
+    return _json(
+        {
+            "status": "created" if created else "exists",
+            "channel": info,
+            "user": auth_user,
+        }
+    )
 
 
 def handle_join_channel(headers, body):
     """Handle POST /api/join-channel."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     channel = str(data.get("channel", "")).strip()
-    user = auth_user
-
-    ok, info = join_channel(channel, user)
+    ok, info = join_channel(channel, auth_user)
     if not ok:
         if info == "channel-not-found":
             return _json(build_error("channel-not-found", "Channel does not exist"))
         return _json(build_error("invalid-channel", "Channel name is required"))
 
-    return _json({"status": "joined", "channel": info, "user": user})
+    return _json({"status": "joined", "channel": info, "user": auth_user})
 
 
 def handle_join_or_create_channel(headers, body):
     """Handle POST /api/channel-upsert as merged join/create behavior."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
@@ -511,9 +378,9 @@ def handle_join_or_create_channel(headers, body):
 
 def handle_rename_channel(headers, body):
     """Handle POST /api/channel/rename."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
@@ -532,14 +399,18 @@ def handle_rename_channel(headers, body):
             return _json(build_error("forbidden", "You are not a member of this channel"))
         return _json(build_error("invalid-channel", "Invalid channel name"))
 
+    _bump_channel_version(channel)
+    if channel != info:
+        _bump_channel_version(info)
+
     return _json({"status": "ok", "channel": info})
 
 
 def handle_leave_channel(headers, body):
     """Handle POST /api/channel/leave."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
@@ -556,14 +427,15 @@ def handle_leave_channel(headers, body):
             return _json(build_error("forbidden", "Unauthorized"))
         return _json(build_error("invalid-channel", "Invalid channel name"))
 
+    _bump_channel_version(channel)
     return _json({"status": "ok", "channel": info.get("channel", ""), "removed": True})
 
 
 def handle_get_channel_msgs(headers, body):
     """Handle POST /api/get-messages."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
@@ -577,299 +449,242 @@ def handle_get_channel_msgs(headers, body):
 
 
 def handle_send_channel_msg(headers, body):
-    """Handle POST /api/send-channel and replicate to connected peers."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+    """Handle POST /api/send-channel and persist to central channel history."""
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
     channel = str(data.get("channel", "general")).strip() or "general"
-    sender = auth_user
     message = str(data.get("message", "")).strip()
+
+    if not is_channel_member(channel, auth_user):
+        return _json(build_error("forbidden", "You are not a member of this channel"))
 
     if not message:
         return _json(build_error("missing-message", "Missing message"))
     if len(message) > 2000:
         return _json(build_error("message-too-long", "Message exceeds 2000 chars"))
 
-    stored = add_message(channel, sender, message)
+    stored = add_message(channel, auth_user, message)
+    seq = _bump_channel_version(channel)
 
-    peers = get_all_peers()
-    delivered = 0
-    delivered_lock = threading.Lock()
+    return _json({"status": "ok", "channel": channel, "seq": seq, "message": stored})
 
-    def _send_channel(info):
-        nonlocal delivered
-        envelope = build_envelope(
-            COMMAND_CHANNEL_MESSAGE,
-            payload={"channel": channel, "message": message},
-            sender=sender,
-        )
-        ok = _send_http_post(
-            info["ip"],
-            info["port"],
-            envelope,
-            endpoint="/api/receive-channel",
-        )
-        if ok:
-            with delivered_lock:
-                delivered += 1
 
-    threads = []
-    for info in peers.values():
-        worker = threading.Thread(target=_send_channel, args=(info,), daemon=True)
-        worker.start()
-        threads.append(worker)
+def handle_channel_long_poll(headers, body):
+    """Handle POST /api/channel/long-poll for bounded channel updates."""
+    auth_user, _peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
-    for worker in threads:
-        worker.join(timeout=2)
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
 
-    return _json({"status": "ok", "delivered": delivered, "message": stored})
+    channel = str(data.get("channel", "general")).strip() or "general"
+    if not is_channel_member(channel, auth_user):
+        return _json(build_error("forbidden", "You are not a member of this channel"))
+
+    last_seq = _safe_int(data.get("last_seq", -1), -1, -1, 10_000_000)
+    timeout_seconds = _safe_int(
+        data.get("timeout_seconds", DEFAULT_CHANNEL_LONG_POLL_SECONDS),
+        DEFAULT_CHANNEL_LONG_POLL_SECONDS,
+        MIN_CHANNEL_LONG_POLL_SECONDS,
+        MAX_CHANNEL_LONG_POLL_SECONDS,
+    )
+
+    deadline = time.time() + timeout_seconds
+    current_seq = _channel_version(channel)
+
+    with _channel_condition:
+        while current_seq == last_seq:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            _channel_condition.wait(timeout=remaining)
+            current_seq = int(_channel_versions.get(channel, 0))
+
+    has_update = current_seq != last_seq
+    payload = {
+        "status": "ok",
+        "channel": channel,
+        "seq": current_seq,
+        "has_update": has_update,
+        "messages": get_messages(channel) if has_update else [],
+    }
+    return _json(payload)
 
 
 def handle_get_online_peers(headers, body):
-    """Handle GET /api/online-peers for peer discovery sidebar."""
+    """Handle GET /api/online-peers for signaling discovery sidebar."""
     _ = body
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
 
-    _register_authenticated_peer(headers)
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
-    known_peers = {}
+    _touch_presence(auth_user, auth_peer_id)
+    peers = _collect_online_peers(exclude_peer_id=auth_peer_id)
 
-    for peer_id, info in get_tracker_peers().items():
-        safe_peer_id = str(peer_id)
-        known_user_id = get_username_for_peer_id(safe_peer_id)
-        known_peers[safe_peer_id] = {
-            "peer_id": safe_peer_id,
-            "user_id": known_user_id or safe_peer_id,
-            "ip": str(info.get("ip", "")),
-            "port": int(info.get("port", 0)) if info.get("port") is not None else 0,
-            "source": "tracker",
-        }
-
-    for peer_id, info in get_all_peers().items():
-        safe_peer_id = str(peer_id)
-        owner_username = str(info.get("owner_username", "") or "").strip()
-        known_user_id = owner_username or get_username_for_peer_id(safe_peer_id)
-        known_peers[safe_peer_id] = {
-            "peer_id": safe_peer_id,
-            "user_id": known_user_id or safe_peer_id,
-            "ip": str(info.get("ip", "")),
-            "port": int(info.get("port", 0)) if info.get("port") is not None else 0,
-            "source": "direct",
-        }
-
-    peers = sorted(known_peers.values(), key=lambda item: item["peer_id"])
-    return _json({"status": "ok", "peers": peers})
+    return _json({"status": "ok", "peer_id": auth_peer_id, "peers": peers})
 
 
-def handle_list_p2p_rooms(headers, body):
-    """Handle POST /api/p2p/rooms for one authenticated user."""
-    _ = body
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
-
-    rooms = list_rooms(auth_user)
-    return _json({"status": "ok", "rooms": rooms})
-
-
-def handle_create_p2p_room(headers, body):
-    """Handle POST /api/p2p/create-room for local private chat rooms."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+def handle_signal_offer(headers, body):
+    """Handle POST /api/signal/offer for WebRTC offer relay."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    peers = data.get("peers", [])
+    to_peer_id, target_error = _read_signal_target(data, auth_peer_id)
+    if target_error:
+        return target_error
+
+    sdp = str(data.get("sdp", "")).strip()
+    if not sdp:
+        return _json(build_error("missing-fields", "sdp is required"))
+
+    room_id = str(data.get("room_id", "")).strip()
     room_name = str(data.get("room_name", "")).strip()
-    if not room_name:
-        room_name = _default_private_room_name(peers)
 
-    ok, message, room = create_private_room(auth_user, room_name, peers)
-    if not ok:
-        return _json(build_error("invalid-room", message))
-
-    return _json({"status": "created", "room": room})
-
-
-def handle_get_or_create_direct_room(headers, body):
-    """Handle POST /api/p2p/direct-room for one peer conversation."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
-
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    peer_id = str(data.get("peer_id", "")).strip()
-    if not peer_id:
-        return _json(build_error("missing-fields", "peer_id is required"))
-
-    room = get_or_create_direct_room(auth_user, peer_id)
-    if not room:
-        return _json(build_error("invalid-room", "Unable to create direct room"))
-
-    return _json({"status": "ok", "room": room})
-
-
-def handle_get_p2p_messages(headers, body):
-    """Handle POST /api/p2p/messages for one room's local history."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
-
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    room_id = str(data.get("room_id", "")).strip()
-    if not room_id:
-        return _json(build_error("invalid-room", "room_id is required"))
-
-    room = get_room(auth_user, room_id)
-    if not room:
-        return _json(build_error("room-not-found", "Room not found"))
-
-    messages = get_room_messages(auth_user, room_id)
-    return _json({"status": "ok", "room": room, "messages": messages})
-
-
-def handle_send_p2p_room_message(headers, body):
-    """Handle POST /api/p2p/send-room and fan-out to room peers."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
-    sender_peer_id = _authenticated_peer_id(headers) or auth_user
-
-    data = _parse_json(body)
-    if data is None:
-        return _json(build_error("invalid-json", "Invalid JSON"))
-
-    room_id = str(data.get("room_id", "")).strip()
-    message = str(data.get("message", "")).strip()
-
-    if not room_id:
-        return _json(build_error("invalid-room", "room_id is required"))
-    if not message:
-        return _json(build_error("missing-message", "Missing message"))
-
-    room = get_room(auth_user, room_id)
-    if not room:
-        return _json(build_error("room-not-found", "Room not found"))
-
-    shared_room_id = to_shared_private_room_id(room_id)
-
-    peers = room.get("peers", [])
-    if not peers:
-        return _json(build_error("invalid-room", "Room has no peers"))
-
-    delivered = 0
-    stored = []
-
-    primary_peer = str(peers[0])
-    item = add_room_message(
+    event_id = _queue_signal_event(
+        "offer",
         auth_user,
-        room_id,
-        primary_peer,
-        auth_user,
-        message,
-        "sent",
+        auth_peer_id,
+        to_peer_id,
+        {"sdp": sdp, "room_id": room_id, "room_name": room_name},
     )
-    if item:
-        stored.append(item)
 
-    for peer_id in peers:
-        if str(peer_id) == str(sender_peer_id):
-            continue
-
-        peer_info = get_peer_info(peer_id)
-        if not peer_info:
-            continue
-
-        recipient_user = str(peer_info.get("owner_username", "") or "").strip() or "shared"
-
-        envelope = build_envelope(
-            COMMAND_SEND_PEER,
-            payload={
-                "message": message,
-                "to_peer": peer_id,
-                "recipient_user": recipient_user,
-                "room_id": shared_room_id,
-                "room_name": room.get("room_name", ""),
-                "peers": peers,
-            },
-            sender=sender_peer_id,
-        )
-
-        if _send_http_post(peer_info["ip"], peer_info["port"], envelope, endpoint="/receive-msg"):
-            delivered += 1
-
-    return _json({"status": "ok", "room": room, "delivered": delivered, "messages": stored})
+    return _json({"status": "queued", "event_id": event_id, "to_peer_id": to_peer_id})
 
 
-def handle_rename_p2p_room(headers, body):
-    """Handle POST /api/p2p/rename for local room rename."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+def handle_signal_answer(headers, body):
+    """Handle POST /api/signal/answer for WebRTC answer relay."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
+
+    to_peer_id, target_error = _read_signal_target(data, auth_peer_id)
+    if target_error:
+        return target_error
+
+    sdp = str(data.get("sdp", "")).strip()
+    if not sdp:
+        return _json(build_error("missing-fields", "sdp is required"))
 
     room_id = str(data.get("room_id", "")).strip()
-    new_name = str(data.get("new_name", "")).strip()
 
-    ok, info = rename_room(auth_user, room_id, new_name)
-    if not ok:
-        if info == "room-not-found":
-            return _json(build_error("room-not-found", "Room not found"))
-        return _json(build_error("invalid-room", "Invalid room rename request"))
+    event_id = _queue_signal_event(
+        "answer",
+        auth_user,
+        auth_peer_id,
+        to_peer_id,
+        {"sdp": sdp, "room_id": room_id},
+    )
 
-    return _json({"status": "ok", "room_id": room_id, "room_name": info})
+    return _json({"status": "queued", "event_id": event_id, "to_peer_id": to_peer_id})
 
 
-def handle_leave_p2p_room(headers, body):
-    """Handle POST /api/p2p/leave for deleting local room history."""
-    auth_user = _authenticated_user(headers)
-    if not auth_user:
-        return _json(build_error("unauthorized", "Unauthorized"))
+def handle_signal_candidate(headers, body):
+    """Handle POST /api/signal/candidate for ICE candidate relay."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
 
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    room_id = str(data.get("room_id", "")).strip()
-    ok, info = leave_room(auth_user, room_id)
-    if not ok:
-        if info == "room-not-found":
-            return _json(build_error("room-not-found", "Room not found"))
-        return _json(build_error("invalid-room", "Invalid room"))
+    to_peer_id, target_error = _read_signal_target(data, auth_peer_id)
+    if target_error:
+        return target_error
 
-    return _json({"status": "ok", "room_id": info, "removed": True})
+    candidate = data.get("candidate")
+    if candidate is None:
+        return _json(build_error("missing-fields", "candidate is required"))
+
+    payload = {
+        "candidate": candidate,
+        "sdp_mid": data.get("sdp_mid"),
+        "sdp_mline_index": data.get("sdp_mline_index"),
+        "room_id": str(data.get("room_id", "")).strip(),
+    }
+
+    event_id = _queue_signal_event(
+        "candidate",
+        auth_user,
+        auth_peer_id,
+        to_peer_id,
+        payload,
+    )
+
+    return _json({"status": "queued", "event_id": event_id, "to_peer_id": to_peer_id})
 
 
-def handle_receive_channel_msg(headers, body):
-    """Handle /api/receive-channel callback endpoint."""
-    _ = headers
+def handle_signal_poll(headers, body):
+    """Handle POST /api/signal/poll using bounded long polling for signaling events."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
+
     data = _parse_json(body)
     if data is None:
         return _json(build_error("invalid-json", "Invalid JSON"))
 
-    sender, message, channel = _extract_peer_payload(data)
-    message = str(message).strip()
-    if not message:
-        return _json(build_error("empty-message", "Message is empty"))
+    claimed_peer = str(data.get("peer_id", "")).strip()
+    if claimed_peer and claimed_peer != auth_peer_id:
+        return _json(build_error("forbidden", "Peer identity spoofing attempt"))
 
-    add_message(channel, sender, message)
-    return _json({"status": "received"})
+    last_event_id = _safe_int(data.get("last_event_id", 0), 0, 0, 10_000_000_000)
+    timeout_seconds = _safe_int(
+        data.get("timeout_seconds", DEFAULT_SIGNAL_POLL_SECONDS),
+        DEFAULT_SIGNAL_POLL_SECONDS,
+        MIN_SIGNAL_POLL_SECONDS,
+        MAX_SIGNAL_POLL_SECONDS,
+    )
+
+    deadline = time.time() + timeout_seconds
+    pending = []
+
+    with _signal_condition:
+        while True:
+            now_ts = time.time()
+            _cleanup_signal_queues_locked(now_ts)
+
+            pending = _collect_pending_events_locked(auth_peer_id, last_event_id)
+            if pending:
+                break
+
+            remaining = deadline - now_ts
+            if remaining <= 0:
+                break
+
+            _signal_condition.wait(timeout=remaining)
+
+    events = [_sanitize_signal_event(event) for event in pending]
+    new_last_event_id = last_event_id
+    if events:
+        new_last_event_id = max(item["event_id"] for item in events)
+
+    peers = _collect_online_peers(exclude_peer_id=auth_peer_id)
+    return _json(
+        {
+            "status": "ok",
+            "peer_id": auth_peer_id,
+            "events": events,
+            "last_event_id": new_last_event_id,
+            "peers": peers,
+        }
+    )

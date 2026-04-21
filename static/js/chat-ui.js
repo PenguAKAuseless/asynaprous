@@ -4,6 +4,19 @@ const MODE_P2P = "p2p";
 const COMPOSER_NONE = "";
 const COMPOSER_P2P = "p2p";
 
+const STORAGE_NAMESPACE = "asynaprous-p2p-v2";
+const P2P_MESSAGE_LIMIT = 2000;
+
+const SIGNAL_POLL_TIMEOUT_SECONDS = 25;
+const CHANNEL_POLL_TIMEOUT_SECONDS = 25;
+const RETRY_DELAY_MS = 1400;
+
+const RTC_CONFIG = {
+    iceServers: [
+        { urls: ["stun:stun.l.google.com:19302"] }
+    ]
+};
+
 let currentUser = "";
 let localPeerId = "";
 
@@ -16,8 +29,8 @@ let currentTarget = {
 
 let composerMode = COMPOSER_NONE;
 let knownChannels = [];
-let knownP2PRooms = [];
 let knownPeers = [];
+let knownP2PRooms = [];
 
 let selectedPeerIds = [];
 let selectedPeerExpanded = false;
@@ -28,8 +41,442 @@ let sendInFlight = false;
 let toastTimer = null;
 let modalResolver = null;
 
+let signalLoopToken = 0;
+let signalLastEventId = 0;
+let channelLoopToken = 0;
+
+let channelSeqById = {};
+let channelMessagesById = {};
+let roomMessagesById = {};
+
+const peerConnections = new Map();
+
 function normalizeText(value) {
     return String(value || "").trim();
+}
+
+function delay(ms) {
+    return new Promise((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
+}
+
+function nowIso() {
+    return new Date().toISOString();
+}
+
+function formatTimestamp(inputIso) {
+    const value = normalizeText(inputIso);
+    if (!value) {
+        return "";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return value;
+    }
+
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
+    const ss = String(date.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+}
+
+function makeUuid() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+    }
+
+    return `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function readStorageJson(key, fallbackValue) {
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) {
+            return fallbackValue;
+        }
+
+        const parsed = JSON.parse(raw);
+        if (parsed === null || parsed === undefined) {
+            return fallbackValue;
+        }
+
+        return parsed;
+    } catch (error) {
+        console.error("storage read failed", error);
+        return fallbackValue;
+    }
+}
+
+function writeStorageJson(key, value) {
+    try {
+        localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+        console.error("storage write failed", error);
+    }
+}
+
+function roomsStorageKey() {
+    return `${STORAGE_NAMESPACE}:rooms:${localPeerId || "anonymous"}`;
+}
+
+function roomMessagesStorageKey(roomId) {
+    return `${STORAGE_NAMESPACE}:messages:${localPeerId || "anonymous"}:${roomId}`;
+}
+
+function sanitizePeerIds(peerIds) {
+    const output = [];
+    const seen = new Set();
+
+    for (const peerId of Array.isArray(peerIds) ? peerIds : []) {
+        const safePeerId = normalizeText(peerId);
+        if (!safePeerId || seen.has(safePeerId) || safePeerId === localPeerId) {
+            continue;
+        }
+
+        seen.add(safePeerId);
+        output.push(safePeerId);
+    }
+
+    return output;
+}
+
+function sortRoomsByRecent(rooms) {
+    const copy = Array.isArray(rooms) ? rooms.slice() : [];
+    copy.sort((left, right) => {
+        const leftTime = Date.parse(normalizeText(left.updated_at) || "1970-01-01T00:00:00.000Z");
+        const rightTime = Date.parse(normalizeText(right.updated_at) || "1970-01-01T00:00:00.000Z");
+        return rightTime - leftTime;
+    });
+    return copy;
+}
+
+function loadP2PRoomsFromStorage() {
+    const stored = readStorageJson(roomsStorageKey(), []);
+    const sanitized = [];
+
+    for (const room of Array.isArray(stored) ? stored : []) {
+        const roomId = normalizeText(room.room_id);
+        if (!roomId) {
+            continue;
+        }
+
+        const peers = sanitizePeerIds(room.peers);
+        sanitized.push({
+            room_id: roomId,
+            room_name: normalizeText(room.room_name) || "Private Conversation",
+            peers,
+            type: normalizeText(room.type) || (peers.length <= 1 ? "direct" : "private"),
+            updated_at: normalizeText(room.updated_at) || nowIso()
+        });
+    }
+
+    knownP2PRooms = sortRoomsByRecent(sanitized);
+    roomMessagesById = {};
+}
+
+function persistP2PRoomsToStorage() {
+    writeStorageJson(roomsStorageKey(), knownP2PRooms);
+}
+
+function removeRoomMessagesFromStorage(roomId) {
+    delete roomMessagesById[roomId];
+    try {
+        localStorage.removeItem(roomMessagesStorageKey(roomId));
+    } catch (error) {
+        console.error("remove room messages failed", error);
+    }
+}
+
+function loadRoomMessages(roomId) {
+    const safeRoomId = normalizeText(roomId);
+    if (!safeRoomId) {
+        return [];
+    }
+
+    if (Array.isArray(roomMessagesById[safeRoomId])) {
+        return roomMessagesById[safeRoomId].slice();
+    }
+
+    const stored = readStorageJson(roomMessagesStorageKey(safeRoomId), []);
+    const sanitized = [];
+
+    for (const item of Array.isArray(stored) ? stored : []) {
+        const message = normalizeText(item.message);
+        if (!message) {
+            continue;
+        }
+
+        const iso = normalizeText(item.iso_timestamp) || nowIso();
+        sanitized.push({
+            sender: normalizeText(item.sender) || "anonymous",
+            sender_user: normalizeText(item.sender_user),
+            message,
+            iso_timestamp: iso,
+            timestamp: normalizeText(item.timestamp) || formatTimestamp(iso)
+        });
+    }
+
+    roomMessagesById[safeRoomId] = sanitized;
+    return sanitized.slice();
+}
+
+function persistRoomMessages(roomId, messages) {
+    const safeRoomId = normalizeText(roomId);
+    if (!safeRoomId) {
+        return;
+    }
+
+    const safeMessages = Array.isArray(messages) ? messages.slice(-P2P_MESSAGE_LIMIT) : [];
+    roomMessagesById[safeRoomId] = safeMessages;
+    writeStorageJson(roomMessagesStorageKey(safeRoomId), safeMessages);
+}
+
+function directRoomIdForPeer(peerId) {
+    const safePeerId = normalizeText(peerId);
+    const pair = [localPeerId, safePeerId].filter(Boolean).sort();
+    return `direct::${pair.join("::")}`;
+}
+
+function peerLabelById(peerId) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId) {
+        return "";
+    }
+
+    if (safePeerId === localPeerId || safePeerId === currentUser) {
+        return currentUser || safePeerId;
+    }
+
+    const found = knownPeers.find((peer) => normalizeText(peer.peer_id) === safePeerId);
+    if (!found) {
+        return safePeerId;
+    }
+
+    return normalizeText(found.user_id) || safePeerId;
+}
+
+function peerDisplayLabelFromObject(peer) {
+    const peerId = normalizeText(peer.peer_id);
+    const userId = normalizeText(peer.user_id);
+
+    if (!peerId && !userId) {
+        return "unknown";
+    }
+
+    if (userId && peerId && userId !== peerId) {
+        return `${userId} (${peerId})`;
+    }
+
+    return userId || peerId;
+}
+
+function defaultDirectRoomName(peerId) {
+    const label = peerLabelById(peerId) || normalizeText(peerId) || "peer";
+    return `Direct: ${label}`;
+}
+
+function buildPrivateRoomName(peers) {
+    if (!Array.isArray(peers) || peers.length === 0) {
+        return "Private Conversation";
+    }
+
+    const labels = peers.map((peerId) => peerLabelById(peerId) || peerId);
+    if (labels.length <= 2) {
+        return `P2P: ${labels.join(", ")}`;
+    }
+
+    return `P2P: ${labels[0]}, ${labels[1]} +${labels.length - 2}`;
+}
+
+function getRoomById(roomId) {
+    const safeRoomId = normalizeText(roomId);
+    return knownP2PRooms.find((room) => room.room_id === safeRoomId) || null;
+}
+
+function upsertRoom(room) {
+    const safeRoomId = normalizeText(room.room_id);
+    if (!safeRoomId) {
+        return null;
+    }
+
+    const peers = sanitizePeerIds(room.peers);
+    const candidate = {
+        room_id: safeRoomId,
+        room_name: normalizeText(room.room_name) || (peers.length <= 1 ? defaultDirectRoomName(peers[0]) : "Private Conversation"),
+        peers,
+        type: normalizeText(room.type) || (peers.length <= 1 ? "direct" : "private"),
+        updated_at: normalizeText(room.updated_at) || nowIso()
+    };
+
+    const index = knownP2PRooms.findIndex((item) => item.room_id === safeRoomId);
+    if (index >= 0) {
+        knownP2PRooms[index] = {
+            ...knownP2PRooms[index],
+            ...candidate,
+            peers
+        };
+    } else {
+        knownP2PRooms.push(candidate);
+    }
+
+    knownP2PRooms = sortRoomsByRecent(knownP2PRooms);
+    persistP2PRoomsToStorage();
+    renderP2PRoomList();
+
+    const current = getRoomById(safeRoomId);
+    if (current) {
+        syncRoomPeerBindings(current);
+    }
+    return current;
+}
+
+function removeRoom(roomId) {
+    const safeRoomId = normalizeText(roomId);
+    if (!safeRoomId) {
+        return;
+    }
+
+    knownP2PRooms = knownP2PRooms.filter((room) => room.room_id !== safeRoomId);
+    persistP2PRoomsToStorage();
+    removeRoomMessagesFromStorage(safeRoomId);
+
+    peerConnections.forEach((state) => {
+        state.roomIds.delete(safeRoomId);
+    });
+
+    renderP2PRoomList();
+}
+
+function ensureDirectRoom(peerId) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId) {
+        return null;
+    }
+
+    const roomId = directRoomIdForPeer(safePeerId);
+    const existing = getRoomById(roomId);
+    if (existing) {
+        return existing;
+    }
+
+    return upsertRoom({
+        room_id: roomId,
+        room_name: defaultDirectRoomName(safePeerId),
+        peers: [safePeerId],
+        type: "direct",
+        updated_at: nowIso()
+    });
+}
+
+function ensureRoomFromIncoming(senderPeerId, payload) {
+    const safeSenderPeerId = normalizeText(senderPeerId);
+    const payloadRoomId = normalizeText(payload.room_id);
+    const payloadRoomName = normalizeText(payload.room_name);
+
+    const payloadPeers = sanitizePeerIds(payload.peers);
+    if (safeSenderPeerId && !payloadPeers.includes(safeSenderPeerId) && safeSenderPeerId !== localPeerId) {
+        payloadPeers.push(safeSenderPeerId);
+    }
+
+    if (!payloadRoomId && payloadPeers.length <= 1) {
+        return ensureDirectRoom(safeSenderPeerId);
+    }
+
+    const roomId = payloadRoomId || `private::${makeUuid()}`;
+    const existing = getRoomById(roomId);
+    if (existing) {
+        const mergedPeers = sanitizePeerIds(existing.peers.concat(payloadPeers));
+        return upsertRoom({
+            ...existing,
+            peers: mergedPeers,
+            updated_at: nowIso()
+        });
+    }
+
+    const peers = payloadPeers.length > 0 ? payloadPeers : [safeSenderPeerId].filter(Boolean);
+    const roomName = payloadRoomName || (peers.length <= 1 ? defaultDirectRoomName(peers[0]) : buildPrivateRoomName(peers));
+
+    return upsertRoom({
+        room_id: roomId,
+        room_name: roomName,
+        peers,
+        type: peers.length <= 1 ? "direct" : "private",
+        updated_at: nowIso()
+    });
+}
+
+function appendLocalP2PMessage(roomId, message) {
+    const safeRoomId = normalizeText(roomId);
+    if (!safeRoomId) {
+        return;
+    }
+
+    const safeMessage = normalizeText(message.message);
+    if (!safeMessage) {
+        return;
+    }
+
+    const iso = normalizeText(message.iso_timestamp) || nowIso();
+    const item = {
+        sender: normalizeText(message.sender) || "anonymous",
+        sender_user: normalizeText(message.sender_user),
+        message: safeMessage,
+        iso_timestamp: iso,
+        timestamp: normalizeText(message.timestamp) || formatTimestamp(iso)
+    };
+
+    const messages = loadRoomMessages(safeRoomId);
+    messages.push(item);
+    persistRoomMessages(safeRoomId, messages);
+
+    const room = getRoomById(safeRoomId);
+    if (room) {
+        upsertRoom({ ...room, updated_at: nowIso() });
+    }
+}
+
+function setKnownPeers(peers) {
+    const nextPeers = [];
+
+    for (const peer of Array.isArray(peers) ? peers : []) {
+        const peerId = normalizeText(peer.peer_id);
+        if (!peerId || peerId === localPeerId) {
+            continue;
+        }
+
+        nextPeers.push({
+            peer_id: peerId,
+            user_id: normalizeText(peer.user_id) || peerId,
+            online: Boolean(peer.online)
+        });
+    }
+
+    nextPeers.sort((left, right) => {
+        const leftLabel = `${left.user_id}|${left.peer_id}`.toLowerCase();
+        const rightLabel = `${right.user_id}|${right.peer_id}`.toLowerCase();
+        if (leftLabel < rightLabel) {
+            return -1;
+        }
+        if (leftLabel > rightLabel) {
+            return 1;
+        }
+        return 0;
+    });
+
+    knownPeers = nextPeers;
+    renderPeerSearchResults();
+    renderP2PRoomList();
+
+    if (currentTarget.mode === MODE_P2P && currentTarget.id) {
+        const room = getRoomById(currentTarget.id);
+        if (room) {
+            const peerText = room.peers.map(peerLabelById).join(", ");
+            currentTarget.subtitle = peerText ? `Peers: ${peerText}` : "Private conversation";
+            document.getElementById("current-room-subtitle").textContent = currentTarget.subtitle;
+        }
+    }
 }
 
 function showToast(message, isError = false) {
@@ -58,52 +505,36 @@ async function apiJson(url, options = {}) {
         throw new Error("Unauthorized");
     }
 
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(text || `Request failed: ${response.status}`);
+    const text = await response.text();
+    let payload = null;
+
+    if (text) {
+        try {
+            payload = JSON.parse(text);
+        } catch (_error) {
+            payload = text;
+        }
     }
 
-    const payload = await response.json();
+    if (!response.ok) {
+        const message =
+            payload && typeof payload === "object"
+                ? (payload.error && payload.error.message) || payload.message
+                : String(payload || "");
+        throw new Error(message || `Request failed: ${response.status}`);
+    }
+
     if (payload && typeof payload === "object" && !Array.isArray(payload)) {
         if (payload.status === "error") {
             const message =
                 payload.error && payload.error.message
                     ? payload.error.message
-                    : (payload.message || "Request failed");
+                    : payload.message || "Request failed";
             throw new Error(message);
         }
     }
 
     return payload;
-}
-
-function peerLabelById(peerId) {
-    const safePeerId = normalizeText(peerId);
-    if (!safePeerId) {
-        return "";
-    }
-
-    const found = knownPeers.find((peer) => normalizeText(peer.peer_id) === safePeerId);
-    if (!found) {
-        return safePeerId;
-    }
-
-    return normalizeText(found.user_id) || safePeerId;
-}
-
-function peerDisplayLabelFromObject(peer) {
-    const peerId = normalizeText(peer.peer_id);
-    const userId = normalizeText(peer.user_id);
-
-    if (!peerId && !userId) {
-        return "unknown";
-    }
-
-    if (userId && peerId && userId !== peerId) {
-        return `${userId} (${peerId})`;
-    }
-
-    return userId || peerId;
 }
 
 function updateAccountStrip() {
@@ -271,10 +702,9 @@ function updateChatInputState() {
 
     if (hasSelection) {
         input.placeholder = "Type a message and press Enter";
-        return;
+    } else {
+        input.placeholder = "Select a conversation to start chatting";
     }
-
-    input.placeholder = "Select a conversation to start chatting";
 }
 
 function setTarget(mode, id, title, subtitle) {
@@ -289,6 +719,10 @@ function setTarget(mode, id, title, subtitle) {
         subtitle: subtitle || ""
     };
     latestViewToken += 1;
+
+    if (mode === MODE_CHANNEL && id && !Object.prototype.hasOwnProperty.call(channelSeqById, id)) {
+        channelSeqById[id] = -1;
+    }
 
     document.getElementById("current-room-title").textContent = currentTarget.title;
     document.getElementById("current-room-subtitle").textContent = currentTarget.subtitle;
@@ -309,7 +743,7 @@ function renderMessages(messages) {
     const container = document.getElementById("messages");
     container.replaceChildren();
 
-    messages.forEach((message) => {
+    for (const message of Array.isArray(messages) ? messages : []) {
         const row = document.createElement("div");
         row.className = "msg";
 
@@ -319,13 +753,22 @@ function renderMessages(messages) {
 
         const senderNode = document.createElement("span");
         senderNode.className = "msg-sender";
-        const sender = String(message.sender || "anonymous");
-        let senderLabel = sender;
-        if (sender === currentUser) {
+
+        const senderRaw = normalizeText(message.sender) || "anonymous";
+        let senderLabel = senderRaw;
+        if (senderRaw === localPeerId || senderRaw === currentUser || senderRaw === "me") {
             senderLabel = "me";
-        } else if (sender === "me") {
-            senderLabel = "legacy-user";
+        } else {
+            senderLabel = peerLabelById(senderRaw);
         }
+
+        if (senderLabel === senderRaw) {
+            const fallbackUser = normalizeText(message.sender_user);
+            if (fallbackUser) {
+                senderLabel = fallbackUser;
+            }
+        }
+
         senderNode.textContent = `${senderLabel}:`;
 
         row.appendChild(time);
@@ -334,7 +777,7 @@ function renderMessages(messages) {
         row.appendChild(document.createTextNode(" "));
         row.appendChild(document.createTextNode(String(message.message || "")));
         container.appendChild(row);
-    });
+    }
 
     container.scrollTop = container.scrollHeight;
 }
@@ -414,13 +857,14 @@ function renderChannelList() {
         return;
     }
 
-    knownChannels.forEach((channel) => {
+    for (const channel of knownChannels) {
         const item = buildSidebarItem({
             label: `# ${channel}`,
             kind: "channel",
             active: currentTarget.mode === MODE_CHANNEL && currentTarget.id === channel,
             onSelect: async () => {
                 setTarget(MODE_CHANNEL, channel, `# ${channel}`, "Public channel conversation");
+                channelSeqById[channel] = -1;
                 await refreshCurrentMessages();
             },
             onRename: async () => {
@@ -439,6 +883,7 @@ function renderChannelList() {
                 await refreshSidebarData();
                 if (wasActive) {
                     setTarget(MODE_CHANNEL, safeName, `# ${safeName}`, "Public channel conversation");
+                    channelSeqById[safeName] = -1;
                     await refreshCurrentMessages();
                 }
             },
@@ -454,6 +899,9 @@ function renderChannelList() {
                     body: JSON.stringify({ channel })
                 });
 
+                delete channelSeqById[channel];
+                delete channelMessagesById[channel];
+
                 await refreshSidebarData();
                 if (wasActive) {
                     ensureActiveTarget();
@@ -462,7 +910,7 @@ function renderChannelList() {
             }
         });
         list.appendChild(item);
-    });
+    }
 }
 
 function renderP2PRoomList() {
@@ -477,35 +925,34 @@ function renderP2PRoomList() {
         return;
     }
 
-    knownP2PRooms.forEach((room) => {
-        const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
+    for (const room of knownP2PRooms) {
+        const dynamicName =
+            room.type === "direct" && room.peers.length === 1
+                ? defaultDirectRoomName(room.peers[0])
+                : normalizeText(room.room_name) || "Private Conversation";
+
+        const peerText = room.peers.map(peerLabelById).join(", ");
         const item = buildSidebarItem({
-            label: room.room_name,
+            label: dynamicName,
             kind: "conversation",
             active: currentTarget.mode === MODE_P2P && currentTarget.id === room.room_id,
             onSelect: async () => {
                 setTarget(
                     MODE_P2P,
                     room.room_id,
-                    room.room_name,
+                    dynamicName,
                     peerText ? `Peers: ${peerText}` : "Private conversation"
                 );
                 await refreshCurrentMessages();
             },
             onRename: async () => {
-                const safeName = await promptRename("conversation", room.room_name);
-                if (!safeName || safeName === room.room_name) {
+                const safeName = await promptRename("conversation", dynamicName);
+                if (!safeName || safeName === dynamicName) {
                     return;
                 }
 
-                await apiJson("/api/p2p/rename", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ room_id: room.room_id, new_name: safeName })
-                });
-
+                upsertRoom({ ...room, room_name: safeName, updated_at: nowIso() });
                 const wasActive = currentTarget.mode === MODE_P2P && currentTarget.id === room.room_id;
-                await refreshSidebarData();
                 if (wasActive) {
                     setTarget(
                         MODE_P2P,
@@ -517,18 +964,13 @@ function renderP2PRoomList() {
                 }
             },
             onLeave: async () => {
-                if (!(await confirmLeave("conversation", room.room_name))) {
+                if (!(await confirmLeave("conversation", dynamicName))) {
                     return;
                 }
 
                 const wasActive = currentTarget.mode === MODE_P2P && currentTarget.id === room.room_id;
-                await apiJson("/api/p2p/leave", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ room_id: room.room_id })
-                });
+                removeRoom(room.room_id);
 
-                await refreshSidebarData();
                 if (wasActive) {
                     ensureActiveTarget();
                     await refreshCurrentMessages();
@@ -536,7 +978,7 @@ function renderP2PRoomList() {
             }
         });
         list.appendChild(item);
-    });
+    }
 }
 
 function renderPeerSearchResults() {
@@ -569,15 +1011,15 @@ function renderPeerSearchResults() {
         return;
     }
 
-    matches.forEach((peer) => {
+    for (const peer of matches) {
         const li = document.createElement("li");
-        const endpoint = `(${normalizeText(peer.ip)}:${String(peer.port || 0)})`;
-        li.textContent = `${peerDisplayLabelFromObject(peer)} ${endpoint}`;
+        const status = peer.online ? "[online]" : "[offline]";
+        li.textContent = `${peerDisplayLabelFromObject(peer)} ${status}`;
         li.addEventListener("click", () => {
             addSelectedPeer(normalizeText(peer.peer_id));
         });
         list.appendChild(li);
-    });
+    }
 
     list.classList.add("visible");
 }
@@ -643,61 +1085,15 @@ function renderSelectedPeerSelection() {
 }
 
 function addSelectedPeer(peerId) {
-    const safe = normalizeText(peerId);
-    if (!safe || selectedPeerIds.includes(safe)) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId || selectedPeerIds.includes(safePeerId) || safePeerId === localPeerId) {
         return;
     }
 
-    selectedPeerIds.push(safe);
+    selectedPeerIds.push(safePeerId);
     document.getElementById("peer-search-input").value = "";
     selectedPeerExpanded = false;
     renderSelectedPeerSelection();
-    renderPeerSearchResults();
-}
-
-function buildPrivateRoomName(peers) {
-    if (!Array.isArray(peers) || peers.length === 0) {
-        return "Private Conversation";
-    }
-
-    const labels = peers.map((peerId) => peerLabelById(peerId) || peerId);
-    if (labels.length <= 2) {
-        return `P2P: ${labels.join(", ")}`;
-    }
-
-    return `P2P: ${labels[0]}, ${labels[1]} +${labels.length - 2}`;
-}
-
-async function loadChannels() {
-    const data = await apiJson("/api/my-channels", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}"
-    });
-
-    currentUser = normalizeText(data.user);
-    localPeerId = normalizeText(data.peer_id);
-    updateAccountStrip();
-
-    knownChannels = Array.isArray(data.channels) ? data.channels : [];
-    renderChannelList();
-}
-
-async function loadP2PRooms() {
-    const data = await apiJson("/api/p2p/rooms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}"
-    });
-    knownP2PRooms = Array.isArray(data.rooms) ? data.rooms : [];
-    renderP2PRoomList();
-}
-
-async function loadPeerCatalog() {
-    const data = await apiJson("/api/online-peers", { method: "GET" });
-    knownPeers = (Array.isArray(data.peers) ? data.peers : []).filter((peer) => {
-        return normalizeText(peer.peer_id) !== localPeerId;
-    });
     renderPeerSearchResults();
 }
 
@@ -721,17 +1117,22 @@ function ensureActiveTarget() {
         }
 
         if (knownChannels.length > 0) {
-            setTarget(MODE_CHANNEL, knownChannels[0], `# ${knownChannels[0]}`, "Public channel conversation");
+            const defaultChannel = knownChannels[0];
+            setTarget(MODE_CHANNEL, defaultChannel, `# ${defaultChannel}`, "Public channel conversation");
+            channelSeqById[defaultChannel] = -1;
             return;
         }
 
         if (knownP2PRooms.length > 0) {
             const room = knownP2PRooms[0];
-            const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
+            const peerText = room.peers.map(peerLabelById).join(", ");
+            const title = room.type === "direct" && room.peers.length === 1
+                ? defaultDirectRoomName(room.peers[0])
+                : room.room_name;
             setTarget(
                 MODE_P2P,
                 room.room_id,
-                room.room_name,
+                title,
                 peerText ? `Peers: ${peerText}` : "Private conversation"
             );
             return;
@@ -741,9 +1142,40 @@ function ensureActiveTarget() {
     }
 }
 
+async function loadChannels() {
+    const data = await apiJson("/api/my-channels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+    });
+
+    const previousPeerId = localPeerId;
+
+    currentUser = normalizeText(data.user);
+    localPeerId = normalizeText(data.peer_id);
+    updateAccountStrip();
+
+    knownChannels = Array.isArray(data.channels) ? data.channels : [];
+
+    if (localPeerId && localPeerId !== previousPeerId) {
+        signalLastEventId = 0;
+        channelSeqById = {};
+        channelMessagesById = {};
+        loadP2PRoomsFromStorage();
+    }
+
+    renderChannelList();
+    renderP2PRoomList();
+}
+
+async function loadPeerCatalog() {
+    const data = await apiJson("/api/online-peers", { method: "GET" });
+    setKnownPeers(Array.isArray(data.peers) ? data.peers : []);
+}
+
 async function refreshSidebarData() {
     await loadChannels();
-    await Promise.all([loadPeerCatalog(), loadP2PRooms()]);
+    await loadPeerCatalog();
     ensureActiveTarget();
 }
 
@@ -754,32 +1186,602 @@ async function refreshCurrentMessages() {
     }
 
     const token = latestViewToken;
-    if (currentTarget.mode === MODE_CHANNEL) {
-        const messages = await apiJson("/api/get-messages", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ channel: currentTarget.id })
-        });
 
-        if (token !== latestViewToken) {
-            return;
+    if (currentTarget.mode === MODE_CHANNEL) {
+        const cached = channelMessagesById[currentTarget.id];
+        renderMessages(Array.isArray(cached) ? cached : []);
+
+        if (!Object.prototype.hasOwnProperty.call(channelSeqById, currentTarget.id)) {
+            channelSeqById[currentTarget.id] = -1;
         }
 
-        renderMessages(Array.isArray(messages) ? messages : []);
+        if (!Array.isArray(cached)) {
+            try {
+                const snapshot = await apiJson("/api/get-messages", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ channel: currentTarget.id })
+                });
+
+                if (token !== latestViewToken) {
+                    return;
+                }
+
+                channelMessagesById[currentTarget.id] = Array.isArray(snapshot) ? snapshot : [];
+                renderMessages(channelMessagesById[currentTarget.id]);
+            } catch (error) {
+                console.error("channel snapshot failed", error);
+            }
+        }
+
         return;
     }
 
-    const payload = await apiJson("/api/p2p/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ room_id: currentTarget.id })
-    });
-
+    const messages = loadRoomMessages(currentTarget.id);
     if (token !== latestViewToken) {
         return;
     }
 
-    renderMessages(Array.isArray(payload.messages) ? payload.messages : []);
+    renderMessages(messages);
+}
+
+function chooseRoomContextForPeer(state) {
+    for (const roomId of state.roomIds) {
+        const room = getRoomById(roomId);
+        if (room) {
+            return {
+                room_id: room.room_id,
+                room_name: room.room_name
+            };
+        }
+    }
+
+    return {
+        room_id: "",
+        room_name: ""
+    };
+}
+
+function syncRoomPeerBindings(room) {
+    if (!room || !Array.isArray(room.peers)) {
+        return;
+    }
+
+    for (const peerId of room.peers) {
+        const state = ensurePeerConnection(peerId, { roomId: room.room_id });
+        if (state) {
+            state.roomIds.add(room.room_id);
+        }
+    }
+}
+
+function attachDataChannel(state, channel) {
+    if (!state || !channel) {
+        return;
+    }
+
+    state.channel = channel;
+
+    channel.onopen = () => {
+        console.info(`p2p data channel open: ${state.peerId}`);
+    };
+
+    channel.onclose = () => {
+        console.info(`p2p data channel closed: ${state.peerId}`);
+    };
+
+    channel.onerror = (error) => {
+        console.error("p2p data channel error", error);
+    };
+
+    channel.onmessage = (event) => {
+        handleIncomingP2PData(state.peerId, event.data).catch((error) => {
+            console.error("p2p message handling failed", error);
+        });
+    };
+}
+
+function ensurePeerConnection(peerId, options = {}) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId || safePeerId === localPeerId) {
+        return null;
+    }
+
+    let state = peerConnections.get(safePeerId);
+    if (!state) {
+        const pc = new RTCPeerConnection(RTC_CONFIG);
+        state = {
+            peerId: safePeerId,
+            pc,
+            channel: null,
+            pendingRemoteCandidates: [],
+            roomIds: new Set(),
+            isNegotiating: false
+        };
+
+        pc.onicecandidate = (event) => {
+            if (!event.candidate) {
+                return;
+            }
+
+            const roomContext = chooseRoomContextForPeer(state);
+            const candidatePayload = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+
+            sendSignalCandidate(
+                safePeerId,
+                candidatePayload,
+                roomContext.room_id,
+                event.candidate.sdpMid,
+                event.candidate.sdpMLineIndex
+            ).catch((error) => {
+                console.error("send signal candidate failed", error);
+            });
+        };
+
+        pc.ondatachannel = (event) => {
+            attachDataChannel(state, event.channel);
+        };
+
+        pc.onconnectionstatechange = () => {
+            const stateName = pc.connectionState;
+            if (stateName === "failed") {
+                console.warn(`p2p connection failed: ${safePeerId}`);
+            }
+        };
+
+        peerConnections.set(safePeerId, state);
+    }
+
+    if (options.roomId) {
+        state.roomIds.add(options.roomId);
+    }
+
+    if (options.initiator) {
+        void ensureOfferForPeer(state, {
+            roomId: options.roomId || "",
+            roomName: options.roomName || ""
+        });
+    }
+
+    return state;
+}
+
+async function waitForOpenDataChannel(state, timeoutMs = 4500) {
+    const started = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+        if (state && state.channel && state.channel.readyState === "open") {
+            return state.channel;
+        }
+        await delay(120);
+    }
+
+    return null;
+}
+
+async function ensureOfferForPeer(state, roomContext = {}) {
+    if (!state) {
+        return;
+    }
+
+    if (state.channel && state.channel.readyState === "open") {
+        return;
+    }
+
+    if (state.isNegotiating || state.pc.signalingState !== "stable") {
+        return;
+    }
+
+    state.isNegotiating = true;
+
+    try {
+        if (!state.channel || state.channel.readyState === "closed") {
+            const channel = state.pc.createDataChannel("chat");
+            attachDataChannel(state, channel);
+        }
+
+        const offer = await state.pc.createOffer();
+        await state.pc.setLocalDescription(offer);
+
+        await sendSignalOffer(
+            state.peerId,
+            state.pc.localDescription ? state.pc.localDescription.sdp : offer.sdp,
+            roomContext.roomId || "",
+            roomContext.roomName || ""
+        );
+    } finally {
+        state.isNegotiating = false;
+    }
+}
+
+function buildIceCandidateFromPayload(payload) {
+    const raw = payload ? payload.candidate : null;
+    if (!raw) {
+        return null;
+    }
+
+    if (typeof raw === "string") {
+        return new RTCIceCandidate({
+            candidate: raw,
+            sdpMid: payload.sdp_mid === undefined ? null : payload.sdp_mid,
+            sdpMLineIndex: payload.sdp_mline_index === undefined ? null : payload.sdp_mline_index
+        });
+    }
+
+    if (typeof raw === "object") {
+        return new RTCIceCandidate(raw);
+    }
+
+    return null;
+}
+
+async function flushPendingCandidates(state) {
+    if (!state || state.pendingRemoteCandidates.length === 0) {
+        return;
+    }
+
+    const pending = state.pendingRemoteCandidates.slice();
+    state.pendingRemoteCandidates = [];
+
+    for (const candidate of pending) {
+        try {
+            await state.pc.addIceCandidate(candidate);
+        } catch (error) {
+            console.error("add pending ice candidate failed", error);
+        }
+    }
+}
+
+async function postSignal(path, payload) {
+    return apiJson(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+    });
+}
+
+async function sendSignalOffer(toPeerId, sdp, roomId, roomName) {
+    return postSignal("/api/signal/offer", {
+        to_peer_id: toPeerId,
+        sdp,
+        room_id: roomId || "",
+        room_name: roomName || ""
+    });
+}
+
+async function sendSignalAnswer(toPeerId, sdp, roomId) {
+    return postSignal("/api/signal/answer", {
+        to_peer_id: toPeerId,
+        sdp,
+        room_id: roomId || ""
+    });
+}
+
+async function sendSignalCandidate(toPeerId, candidate, roomId, sdpMid, sdpMLineIndex) {
+    return postSignal("/api/signal/candidate", {
+        to_peer_id: toPeerId,
+        candidate,
+        room_id: roomId || "",
+        sdp_mid: sdpMid,
+        sdp_mline_index: sdpMLineIndex
+    });
+}
+
+async function handleSignalOffer(event) {
+    const fromPeerId = normalizeText(event.from_peer_id);
+    if (!fromPeerId) {
+        return;
+    }
+
+    const payload = event.payload || {};
+    const sdp = normalizeText(payload.sdp);
+    if (!sdp) {
+        return;
+    }
+
+    const roomId = normalizeText(payload.room_id);
+    const roomName = normalizeText(payload.room_name);
+
+    const state = ensurePeerConnection(fromPeerId, { roomId });
+    if (!state) {
+        return;
+    }
+
+    if (state.pc.signalingState !== "stable") {
+        try {
+            await state.pc.setLocalDescription({ type: "rollback" });
+        } catch (_error) {
+            console.warn("rollback before offer failed");
+        }
+    }
+
+    await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp }));
+    await flushPendingCandidates(state);
+
+    const answer = await state.pc.createAnswer();
+    await state.pc.setLocalDescription(answer);
+
+    await sendSignalAnswer(
+        fromPeerId,
+        state.pc.localDescription ? state.pc.localDescription.sdp : answer.sdp,
+        roomId
+    );
+
+    const room = ensureRoomFromIncoming(fromPeerId, {
+        room_id: roomId,
+        room_name: roomName,
+        peers: [fromPeerId]
+    });
+    if (room) {
+        syncRoomPeerBindings(room);
+    }
+}
+
+async function handleSignalAnswer(event) {
+    const fromPeerId = normalizeText(event.from_peer_id);
+    if (!fromPeerId) {
+        return;
+    }
+
+    const payload = event.payload || {};
+    const sdp = normalizeText(payload.sdp);
+    if (!sdp) {
+        return;
+    }
+
+    const state = ensurePeerConnection(fromPeerId, { roomId: normalizeText(payload.room_id) });
+    if (!state) {
+        return;
+    }
+
+    await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp }));
+    await flushPendingCandidates(state);
+}
+
+async function handleSignalCandidate(event) {
+    const fromPeerId = normalizeText(event.from_peer_id);
+    if (!fromPeerId) {
+        return;
+    }
+
+    const payload = event.payload || {};
+    const state = ensurePeerConnection(fromPeerId, { roomId: normalizeText(payload.room_id) });
+    if (!state) {
+        return;
+    }
+
+    const candidate = buildIceCandidateFromPayload(payload);
+    if (!candidate) {
+        return;
+    }
+
+    if (state.pc.remoteDescription && state.pc.remoteDescription.type) {
+        await state.pc.addIceCandidate(candidate);
+        return;
+    }
+
+    state.pendingRemoteCandidates.push(candidate);
+}
+
+async function processSignalEvent(event) {
+    const type = normalizeText(event.type).toLowerCase();
+
+    if (type === "offer") {
+        await handleSignalOffer(event);
+        return;
+    }
+
+    if (type === "answer") {
+        await handleSignalAnswer(event);
+        return;
+    }
+
+    if (type === "candidate") {
+        await handleSignalCandidate(event);
+    }
+}
+
+async function handleIncomingP2PData(fromPeerId, rawData) {
+    let payload = null;
+
+    try {
+        payload = JSON.parse(String(rawData || ""));
+    } catch (_error) {
+        return;
+    }
+
+    if (!payload || normalizeText(payload.type) !== "p2p-message") {
+        return;
+    }
+
+    const senderPeerId = normalizeText(payload.sender_peer_id) || normalizeText(fromPeerId);
+    const messageText = normalizeText(payload.message);
+    if (!senderPeerId || !messageText) {
+        return;
+    }
+
+    const room = ensureRoomFromIncoming(senderPeerId, payload);
+    if (!room) {
+        return;
+    }
+
+    const iso = normalizeText(payload.timestamp) || nowIso();
+    appendLocalP2PMessage(room.room_id, {
+        sender: senderPeerId,
+        sender_user: normalizeText(payload.sender_user),
+        message: messageText,
+        iso_timestamp: iso,
+        timestamp: formatTimestamp(iso)
+    });
+
+    if (currentTarget.mode === MODE_P2P && currentTarget.id === room.room_id) {
+        await refreshCurrentMessages();
+    } else {
+        showToast(`New P2P message from ${peerLabelById(senderPeerId)}`);
+    }
+}
+
+async function sendP2PPayloadToPeer(peerId, payload, room) {
+    const safePeerId = normalizeText(peerId);
+    if (!safePeerId || safePeerId === localPeerId) {
+        return false;
+    }
+
+    const state = ensurePeerConnection(safePeerId, {
+        roomId: room.room_id,
+        roomName: room.room_name,
+        initiator: true
+    });
+
+    if (!state) {
+        return false;
+    }
+
+    if (!state.channel || state.channel.readyState !== "open") {
+        await ensureOfferForPeer(state, {
+            roomId: room.room_id,
+            roomName: room.room_name
+        });
+    }
+
+    const channel = await waitForOpenDataChannel(state);
+    if (!channel) {
+        return false;
+    }
+
+    channel.send(JSON.stringify(payload));
+    return true;
+}
+
+async function sendP2PMessage(roomId, messageText) {
+    const room = getRoomById(roomId);
+    if (!room) {
+        throw new Error("Conversation not found");
+    }
+
+    const iso = nowIso();
+    appendLocalP2PMessage(room.room_id, {
+        sender: localPeerId,
+        sender_user: currentUser,
+        message: messageText,
+        iso_timestamp: iso,
+        timestamp: formatTimestamp(iso)
+    });
+
+    const payload = {
+        type: "p2p-message",
+        room_id: room.room_id,
+        room_name: room.room_name,
+        peers: room.peers,
+        sender_peer_id: localPeerId,
+        sender_user: currentUser,
+        message: messageText,
+        timestamp: iso
+    };
+
+    let failed = 0;
+    for (const peerId of room.peers) {
+        const delivered = await sendP2PPayloadToPeer(peerId, payload, room);
+        if (!delivered) {
+            failed += 1;
+        }
+    }
+
+    if (failed > 0) {
+        showToast(`Saved locally. ${failed} peer(s) not connected.`, true);
+    }
+
+    await refreshCurrentMessages();
+}
+
+async function runSignalPollingLoop(token) {
+    while (token === signalLoopToken) {
+        try {
+            const response = await postSignal("/api/signal/poll", {
+                peer_id: localPeerId,
+                last_event_id: signalLastEventId,
+                timeout_seconds: SIGNAL_POLL_TIMEOUT_SECONDS
+            });
+
+            if (token !== signalLoopToken) {
+                return;
+            }
+
+            if (typeof response.last_event_id === "number") {
+                signalLastEventId = response.last_event_id;
+            }
+
+            if (Array.isArray(response.peers)) {
+                setKnownPeers(response.peers);
+            }
+
+            const events = Array.isArray(response.events) ? response.events : [];
+            for (const event of events) {
+                await processSignalEvent(event);
+            }
+        } catch (error) {
+            console.error("signal poll failed", error);
+            await delay(RETRY_DELAY_MS);
+        }
+    }
+}
+
+function startSignalPollingLoop() {
+    signalLoopToken += 1;
+    const token = signalLoopToken;
+    void runSignalPollingLoop(token);
+}
+
+async function runChannelLongPollLoop(token) {
+    while (token === channelLoopToken) {
+        if (currentTarget.mode !== MODE_CHANNEL || !currentTarget.id) {
+            await delay(300);
+            continue;
+        }
+
+        const channel = currentTarget.id;
+        if (!Object.prototype.hasOwnProperty.call(channelSeqById, channel)) {
+            channelSeqById[channel] = -1;
+        }
+
+        const lastSeq = channelSeqById[channel];
+
+        try {
+            const response = await apiJson("/api/channel/long-poll", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    channel,
+                    last_seq: lastSeq,
+                    timeout_seconds: CHANNEL_POLL_TIMEOUT_SECONDS
+                })
+            });
+
+            if (token !== channelLoopToken) {
+                return;
+            }
+
+            if (typeof response.seq === "number") {
+                channelSeqById[channel] = response.seq;
+            }
+
+            if (response.has_update && Array.isArray(response.messages)) {
+                channelMessagesById[channel] = response.messages;
+                if (currentTarget.mode === MODE_CHANNEL && currentTarget.id === channel) {
+                    renderMessages(response.messages);
+                }
+            }
+        } catch (error) {
+            console.error("channel long poll failed", error);
+            await delay(RETRY_DELAY_MS);
+        }
+    }
+}
+
+function startChannelLongPollLoop() {
+    channelLoopToken += 1;
+    const token = channelLoopToken;
+    void runChannelLongPollLoop(token);
 }
 
 async function sendMessage() {
@@ -801,22 +1803,27 @@ async function sendMessage() {
     sendInFlight = true;
     try {
         if (currentTarget.mode === MODE_CHANNEL) {
+            const channel = currentTarget.id;
             await apiJson("/api/send-channel", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ channel: currentTarget.id, message })
+                body: JSON.stringify({ channel, message })
             });
-        } else {
-            await apiJson("/api/p2p/send-room", {
+
+            const snapshot = await apiJson("/api/get-messages", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ room_id: currentTarget.id, message })
+                body: JSON.stringify({ channel })
             });
-            await loadP2PRooms();
+
+            channelMessagesById[channel] = Array.isArray(snapshot) ? snapshot : [];
+            channelSeqById[channel] = -1;
+            await refreshCurrentMessages();
+        } else {
+            await sendP2PMessage(currentTarget.id, message);
         }
 
         input.value = "";
-        await refreshCurrentMessages();
     } catch (error) {
         showToast(error.message || "Send failed", true);
     } finally {
@@ -839,6 +1846,7 @@ async function upsertChannel(channel) {
 
     await refreshSidebarData();
     setTarget(MODE_CHANNEL, safeChannel, `# ${safeChannel}`, "Public channel conversation");
+    channelSeqById[safeChannel] = -1;
     await refreshCurrentMessages();
 }
 
@@ -862,6 +1870,25 @@ async function openChannelCreateFlow() {
     await upsertChannel(outcome.value);
 }
 
+function createOrReuseP2PRoomFromPeers(peers) {
+    const cleanPeers = sanitizePeerIds(peers);
+    if (cleanPeers.length === 0) {
+        return null;
+    }
+
+    if (cleanPeers.length === 1) {
+        return ensureDirectRoom(cleanPeers[0]);
+    }
+
+    return upsertRoom({
+        room_id: `private::${makeUuid()}`,
+        room_name: buildPrivateRoomName(cleanPeers),
+        peers: cleanPeers,
+        type: "private",
+        updated_at: nowIso()
+    });
+}
+
 async function createP2PRoomFromComposer() {
     const peers = selectedPeerIds.slice();
     if (peers.length === 0) {
@@ -869,14 +1896,11 @@ async function createP2PRoomFromComposer() {
         return;
     }
 
-    const payload = await apiJson("/api/p2p/create-room", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            peers,
-            room_name: buildPrivateRoomName(peers)
-        })
-    });
+    const room = createOrReuseP2PRoomFromPeers(peers);
+    if (!room) {
+        showToast("Unable to create conversation", true);
+        return;
+    }
 
     selectedPeerIds = [];
     selectedPeerExpanded = false;
@@ -884,20 +1908,42 @@ async function createP2PRoomFromComposer() {
     renderSelectedPeerSelection();
     renderPeerSearchResults();
 
-    await loadP2PRooms();
-    const room = payload.room;
-    const peerText = Array.isArray(room.peers) ? room.peers.map(peerLabelById).join(", ") : "";
+    const peerText = room.peers.map(peerLabelById).join(", ");
+    const title = room.type === "direct" && room.peers.length === 1
+        ? defaultDirectRoomName(room.peers[0])
+        : room.room_name;
+
     setTarget(
         MODE_P2P,
         room.room_id,
-        room.room_name,
+        title,
         peerText ? `Peers: ${peerText}` : "Private conversation"
     );
+
+    syncRoomPeerBindings(room);
+
+    for (const peerId of room.peers) {
+        const state = ensurePeerConnection(peerId, {
+            roomId: room.room_id,
+            roomName: room.room_name,
+            initiator: true
+        });
+
+        if (state) {
+            await ensureOfferForPeer(state, {
+                roomId: room.room_id,
+                roomName: room.room_name
+            });
+        }
+    }
+
     await refreshCurrentMessages();
 }
 
 async function logout() {
     try {
+        signalLoopToken += 1;
+        channelLoopToken += 1;
         await fetch("/logout", {
             method: "POST",
             credentials: "same-origin"
@@ -921,10 +1967,7 @@ function bindUi() {
     });
 
     document.getElementById("msg-input").addEventListener("keydown", (event) => {
-        if (event.key !== "Enter") {
-            return;
-        }
-        if (event.repeat) {
+        if (event.key !== "Enter" || event.repeat) {
             return;
         }
         event.preventDefault();
@@ -1010,28 +2053,11 @@ async function initialize() {
     try {
         await refreshSidebarData();
         await refreshCurrentMessages();
+        startSignalPollingLoop();
+        startChannelLongPollLoop();
     } catch (error) {
         showToast(error.message || "Initialization failed", true);
     }
-
-    window.setInterval(() => {
-        refreshCurrentMessages().catch((error) => {
-            console.error("message refresh failed", error);
-        });
-    }, 2000);
-
-    window.setInterval(() => {
-        if (document.querySelector(".row-menu.open")) {
-            return;
-        }
-        if (document.getElementById("action-modal")?.classList.contains("visible")) {
-            return;
-        }
-
-        refreshSidebarData().catch((error) => {
-            console.error("sidebar refresh failed", error);
-        });
-    }, 5000);
 }
 
 window.addEventListener("load", initialize);
