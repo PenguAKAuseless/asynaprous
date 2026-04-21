@@ -30,6 +30,7 @@ from .chat.handlers import (
     handle_get_channel_msgs,
     handle_get_channels,
     handle_get_online_peers,
+    handle_resolve_peer,
     handle_get_user_channels,
     handle_join_or_create_channel,
     handle_join_channel,
@@ -193,6 +194,11 @@ def api_channel_long_poll(headers, body):
 @app.route("/api/online-peers", methods=["GET"])
 def api_online_peers(headers, body):
     return handle_get_online_peers(headers, body)
+
+
+@app.route("/api/peer/resolve", methods=["POST"])
+def api_peer_resolve(headers, body):
+    return handle_resolve_peer(headers, body)
 
 
 @app.route("/api/signal/offer", methods=["POST"])

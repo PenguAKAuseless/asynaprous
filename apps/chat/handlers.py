@@ -78,6 +78,11 @@ def _safe_int(value, default, minimum, maximum):
     return parsed
 
 
+def _normalize_peer_id(peer_id):
+    """Normalize peer IDs for consistent comparisons and DB lookups."""
+    return str(peer_id or "").strip().lower()
+
+
 def _authenticated_user(headers):
     """Read authenticated username propagated by HTTP adapter."""
     if not headers:
@@ -91,14 +96,14 @@ def _authenticated_peer(headers):
     if not username:
         return "", ""
 
-    peer_id = get_peer_id_for_user(username)
-    return username, str(peer_id or "").strip()
+    peer_id = _normalize_peer_id(get_peer_id_for_user(username))
+    return username, peer_id
 
 
 def _touch_presence(username, peer_id):
     """Update in-memory presence for one authenticated peer."""
     safe_user = str(username or "").strip()
-    safe_peer = str(peer_id or "").strip()
+    safe_peer = _normalize_peer_id(peer_id)
     if not safe_user or not safe_peer:
         return
 
@@ -111,7 +116,7 @@ def _touch_presence(username, peer_id):
 
 def _collect_online_peers(exclude_peer_id=""):
     """Return online peers observed recently via authenticated requests."""
-    safe_exclude = str(exclude_peer_id or "").strip()
+    safe_exclude = _normalize_peer_id(exclude_peer_id)
     now = time.time()
     peers = []
 
@@ -123,13 +128,14 @@ def _collect_online_peers(exclude_peer_id=""):
                 stale_peers.append(peer_id)
                 continue
 
-            if peer_id == safe_exclude:
+            normalized_peer_id = _normalize_peer_id(peer_id)
+            if normalized_peer_id == safe_exclude:
                 continue
 
             user_id = str(info.get("user_id", "")).strip() or get_username_for_peer_id(peer_id)
             peers.append(
                 {
-                    "peer_id": str(peer_id),
+                    "peer_id": normalized_peer_id,
                     "user_id": user_id or str(peer_id),
                     "online": True,
                 }
@@ -260,11 +266,11 @@ def _read_signal_target(data, sender_peer_id):
     if not isinstance(data, dict):
         return "", _json(build_error("invalid-json", "Invalid JSON"))
 
-    claimed_from = str(data.get("from_peer_id", "")).strip()
+    claimed_from = _normalize_peer_id(data.get("from_peer_id", ""))
     if claimed_from and claimed_from != sender_peer_id:
         return "", _json(build_error("forbidden", "Peer identity spoofing attempt"))
 
-    to_peer_id = str(data.get("to_peer_id", data.get("to_peer", ""))).strip()
+    to_peer_id = _normalize_peer_id(data.get("to_peer_id", data.get("to_peer", "")))
     if not to_peer_id:
         return "", _json(build_error("missing-fields", "to_peer_id is required"))
 
@@ -532,6 +538,42 @@ def handle_get_online_peers(headers, body):
     peers = _collect_online_peers(exclude_peer_id=auth_peer_id)
 
     return _json({"status": "ok", "peer_id": auth_peer_id, "peers": peers})
+
+
+def handle_resolve_peer(headers, body):
+    """Handle POST /api/peer/resolve for explicit peer-id lookups."""
+    auth_user, auth_peer_id, unauthorized = _require_authenticated_peer(headers)
+    if unauthorized:
+        return unauthorized
+
+    _touch_presence(auth_user, auth_peer_id)
+
+    data = _parse_json(body)
+    if data is None:
+        return _json(build_error("invalid-json", "Invalid JSON"))
+
+    peer_id = _normalize_peer_id(data.get("peer_id", ""))
+    if not peer_id:
+        return _json(build_error("missing-fields", "peer_id is required"))
+
+    if peer_id == auth_peer_id:
+        return _json(build_error("invalid-peer", "Cannot start P2P with yourself"))
+
+    username = get_username_for_peer_id(peer_id)
+    if not username:
+        return _json(build_error("peer-not-found", "Peer not found"))
+
+    online = any(item.get("peer_id") == peer_id for item in _collect_online_peers())
+    return _json(
+        {
+            "status": "ok",
+            "peer": {
+                "peer_id": peer_id,
+                "user_id": username,
+                "online": online,
+            },
+        }
+    )
 
 
 def handle_signal_offer(headers, body):
