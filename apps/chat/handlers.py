@@ -762,8 +762,11 @@ def handle_signal_offer(headers, body):
     if target_error:
         return target_error
 
-    sdp = str(data.get("sdp", "")).strip()
-    if not sdp:
+    # Do NOT .strip() the SDP: Chrome's WebRTC parser requires every line,
+    # including the last, to end with CRLF. Stripping trailing whitespace
+    # drops the final \r\n and makes setRemoteDescription reject the SDP.
+    sdp = str(data.get("sdp", "") or "")
+    if not sdp.strip():
         return _json(build_error("missing-fields", "sdp is required"))
 
     room_id = str(data.get("room_id", "")).strip()
@@ -794,8 +797,10 @@ def handle_signal_answer(headers, body):
     if target_error:
         return target_error
 
-    sdp = str(data.get("sdp", "")).strip()
-    if not sdp:
+    # See offer handler: preserve CRLF in SDP so the receiver's WebRTC
+    # parser accepts it.
+    sdp = str(data.get("sdp", "") or "")
+    if not sdp.strip():
         return _json(build_error("missing-fields", "sdp is required"))
 
     room_id = str(data.get("room_id", "")).strip()

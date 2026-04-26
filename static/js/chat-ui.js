@@ -1532,6 +1532,9 @@ function ensurePeerConnection(peerId, options = {}) {
 
     if (!state) {
         const pc = new RTCPeerConnection(RTC_CONFIG);
+        // Perfect Negotiation: deterministic role from peer-id comparison.
+        // Both ends compute opposite values so exactly one is polite.
+        const polite = String(localPeerId) < String(safePeerId);
         state = {
             peerId: safePeerId,
             pc,
@@ -1539,8 +1542,10 @@ function ensurePeerConnection(peerId, options = {}) {
             pendingRemoteCandidates: [],
             pendingOutgoingMessages: carryPendingOutgoing,
             roomIds: new Set(carryRoomIds),
-            isNegotiating: false,
-            lastOfferSentAtMs: 0
+            polite,
+            makingOffer: false,
+            ignoreOffer: false,
+            isSettingRemoteAnswerPending: false
         };
 
         pc.onicecandidate = (event) => {
@@ -1566,6 +1571,24 @@ function ensurePeerConnection(peerId, options = {}) {
             attachDataChannel(state, event.channel);
         };
 
+        pc.onnegotiationneeded = async () => {
+            const roomContext = chooseRoomContextForPeer(state);
+            try {
+                state.makingOffer = true;
+                await pc.setLocalDescription();
+                await sendSignalOffer(
+                    state.peerId,
+                    pc.localDescription ? pc.localDescription.sdp : "",
+                    roomContext.room_id,
+                    roomContext.room_name
+                );
+            } catch (error) {
+                console.error("negotiation needed failed", error);
+            } finally {
+                state.makingOffer = false;
+            }
+        };
+
         pc.onconnectionstatechange = () => {
             const stateName = pc.connectionState;
             if (stateName === "failed" || stateName === "closed") {
@@ -1582,11 +1605,8 @@ function ensurePeerConnection(peerId, options = {}) {
         state.roomIds.add(options.roomId);
     }
 
-    if (options.initiator) {
-        void ensureOfferForPeer(state, {
-            roomId: options.roomId || "",
-            roomName: options.roomName || ""
-        });
+    if (options.initiate) {
+        ensureChannelForPeer(state);
     }
 
     return state;
@@ -1605,55 +1625,23 @@ async function waitForOpenDataChannel(state, timeoutMs = 4500) {
     return null;
 }
 
-async function ensureOfferForPeer(state, roomContext = {}) {
-    if (!state) {
+function ensureChannelForPeer(state) {
+    // Create a data channel on this side if neither side has one yet.
+    // Creating a data channel triggers `onnegotiationneeded`, which drives
+    // the offer through the Perfect Negotiation flow.
+    if (!state || !state.pc) {
         return;
     }
 
-    if (state.channel && state.channel.readyState === "open") {
+    if (state.channel) {
         return;
     }
-
-    if (state.isNegotiating) {
-        return;
-    }
-
-    if (state.pc.signalingState !== "stable") {
-        const offerAgeMs = Date.now() - Number(state.lastOfferSentAtMs || 0);
-        const canRollbackStaleOffer = state.pc.signalingState === "have-local-offer" && offerAgeMs > 8000;
-
-        if (canRollbackStaleOffer) {
-            try {
-                await state.pc.setLocalDescription({ type: "rollback" });
-            } catch (error) {
-                console.warn("rollback stale offer failed", error);
-                return;
-            }
-        } else {
-            return;
-        }
-    }
-
-    state.isNegotiating = true;
 
     try {
-        if (!state.channel || state.channel.readyState === "closed") {
-            const channel = state.pc.createDataChannel("chat");
-            attachDataChannel(state, channel);
-        }
-
-        const offer = await state.pc.createOffer();
-        await state.pc.setLocalDescription(offer);
-
-        await sendSignalOffer(
-            state.peerId,
-            state.pc.localDescription ? state.pc.localDescription.sdp : offer.sdp,
-            roomContext.roomId || "",
-            roomContext.roomName || ""
-        );
-        state.lastOfferSentAtMs = Date.now();
-    } finally {
-        state.isNegotiating = false;
+        const channel = state.pc.createDataChannel("chat");
+        attachDataChannel(state, channel);
+    } catch (error) {
+        console.error("create data channel failed", error);
     }
 }
 
@@ -1746,8 +1734,10 @@ async function handleSignalOffer(event) {
     }
 
     const payload = event.payload || {};
-    const sdp = normalizeText(payload.sdp);
-    if (!sdp) {
+    // Preserve raw SDP (including trailing CRLF) — Chrome's parser rejects
+    // SDPs whose final line lacks its CRLF terminator.
+    const sdp = String(payload.sdp || "");
+    if (!sdp.trim()) {
         return;
     }
 
@@ -1759,25 +1749,32 @@ async function handleSignalOffer(event) {
         return;
     }
 
-    if (state.pc.signalingState !== "stable") {
-        try {
-            await state.pc.setLocalDescription({ type: "rollback" });
-        } catch (_error) {
-            console.warn("rollback before offer failed");
-        }
+    // Perfect Negotiation: detect glare and ignore the incoming offer
+    // when this peer is impolite and is also currently making/holding
+    // a local offer. The polite peer always accepts (rolls back local).
+    const readyForOffer =
+        !state.makingOffer &&
+        (state.pc.signalingState === "stable" || state.isSettingRemoteAnswerPending);
+    const offerCollision = !readyForOffer;
+
+    state.ignoreOffer = !state.polite && offerCollision;
+    if (state.ignoreOffer) {
+        return;
     }
 
-    await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp }));
-    await flushPendingCandidates(state);
-
-    const answer = await state.pc.createAnswer();
-    await state.pc.setLocalDescription(answer);
-
-    await sendSignalAnswer(
-        fromPeerId,
-        state.pc.localDescription ? state.pc.localDescription.sdp : answer.sdp,
-        roomId
-    );
+    try {
+        await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp }));
+        await flushPendingCandidates(state);
+        await state.pc.setLocalDescription();
+        await sendSignalAnswer(
+            fromPeerId,
+            state.pc.localDescription ? state.pc.localDescription.sdp : "",
+            roomId
+        );
+    } catch (error) {
+        console.error("handle signal offer failed", error);
+        return;
+    }
 
     const room = ensureRoomFromIncoming(fromPeerId, {
         room_id: roomId,
@@ -1796,8 +1793,9 @@ async function handleSignalAnswer(event) {
     }
 
     const payload = event.payload || {};
-    const sdp = normalizeText(payload.sdp);
-    if (!sdp) {
+    // Preserve raw SDP — see handleSignalOffer.
+    const sdp = String(payload.sdp || "");
+    if (!sdp.trim()) {
         return;
     }
 
@@ -1806,7 +1804,21 @@ async function handleSignalAnswer(event) {
         return;
     }
 
-    await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp }));
+    if (state.pc.signalingState !== "have-local-offer") {
+        // Stale answer (e.g. we already rolled back due to glare); ignore.
+        return;
+    }
+
+    state.isSettingRemoteAnswerPending = true;
+    try {
+        await state.pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp }));
+    } catch (error) {
+        console.error("set remote answer failed", error);
+        return;
+    } finally {
+        state.isSettingRemoteAnswerPending = false;
+    }
+
     await flushPendingCandidates(state);
 }
 
@@ -1827,12 +1839,18 @@ async function handleSignalCandidate(event) {
         return;
     }
 
-    if (state.pc.remoteDescription && state.pc.remoteDescription.type) {
-        await state.pc.addIceCandidate(candidate);
+    if (!state.pc.remoteDescription || !state.pc.remoteDescription.type) {
+        state.pendingRemoteCandidates.push(candidate);
         return;
     }
 
-    state.pendingRemoteCandidates.push(candidate);
+    try {
+        await state.pc.addIceCandidate(candidate);
+    } catch (error) {
+        if (!state.ignoreOffer) {
+            console.error("add ice candidate failed", error);
+        }
+    }
 }
 
 async function processSignalEvent(event) {
@@ -1911,37 +1929,11 @@ async function handleP2PRoomSignal(event) {
         return;
     }
 
+    // Don't initiate from the receiver. The room creator already calls
+    // ensureChannelForPeer; if its offer is delayed or lost, glare is
+    // resolved by Perfect Negotiation when the receiver later sends a
+    // message and creates its own data channel.
     syncRoomPeerBindings(room);
-
-    const state = ensurePeerConnection(fromPeerId, {
-        roomId: room.room_id,
-        roomName: room.room_name
-    });
-    if (!state) {
-        return;
-    }
-
-    window.setTimeout(() => {
-        if (peerConnections.get(fromPeerId) !== state) {
-            return;
-        }
-
-        if (state.channel && state.channel.readyState === "open") {
-            return;
-        }
-
-        const hasRemoteDescription = Boolean(state.pc.remoteDescription && state.pc.remoteDescription.type);
-        if (hasRemoteDescription) {
-            return;
-        }
-
-        ensureOfferForPeer(state, {
-            roomId: room.room_id,
-            roomName: room.room_name
-        }).catch((error) => {
-            console.error("fallback room-offer failed", error);
-        });
-    }, 1200);
 }
 
 async function handleChannelUpdateSignal(event) {
@@ -2017,7 +2009,7 @@ async function sendP2PPayloadToPeer(peerId, payload, room) {
     const state = ensurePeerConnection(safePeerId, {
         roomId: room.room_id,
         roomName: room.room_name,
-        initiator: true
+        initiate: true
     });
 
     if (!state) {
@@ -2032,19 +2024,13 @@ async function sendP2PPayloadToPeer(peerId, payload, room) {
 
     state.pendingOutgoingMessages.push(serializedPayload);
 
-    if (!state.channel || state.channel.readyState !== "open") {
-        await ensureOfferForPeer(state, {
-            roomId: room.room_id,
-            roomName: room.room_name
-        });
-    }
-
-    const channel = await waitForOpenDataChannel(state, 1200);
+    const channel = await waitForOpenDataChannel(state, 4500);
     if (channel) {
         flushPendingOutgoingMessages(state);
+        return true;
     }
 
-    return true;
+    return false;
 }
 
 async function sendP2PMessage(roomId, messageText) {
@@ -2351,20 +2337,10 @@ async function createP2PRoomFromComposer() {
         const state = ensurePeerConnection(peerId, {
             roomId: room.room_id,
             roomName: room.room_name,
-            initiator: true
+            initiate: true
         });
 
-        if (state) {
-            try {
-                await ensureOfferForPeer(state, {
-                    roomId: room.room_id,
-                    roomName: room.room_name
-                });
-            } catch (error) {
-                failedOffers += 1;
-                console.error("initial room offer failed", error);
-            }
-        } else {
+        if (!state) {
             failedOffers += 1;
         }
     }
